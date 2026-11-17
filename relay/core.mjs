@@ -14,6 +14,32 @@ export function createRelay({ now = () => Date.now() } = {}) {
   const isOnline = s => now() - s.lastSeen <= ONLINE_WINDOW_MS
   const byName = name => [...sessions.values()].find(s => s.name === name)
 
+  // 每个会话一个在登记期间不变的小编号，IM 里可以用 @2、/use 2 指代。
+  function freeNumber() {
+    const used = new Set([...sessions.values()].map(s => s.num))
+    let n = 1
+    while (used.has(n)) n++
+    return n
+  }
+
+  // 按编号、完整名字或唯一前缀找会话；找不到或有歧义时返回给 IM 的提示。
+  function resolve(ref) {
+    const all = [...sessions.values()]
+    if (/^\d+$/.test(ref)) {
+      const s = all.find(x => x.num === Number(ref))
+      return s ? { session: s } : { error: `没有编号 ${ref} 的会话，发 /list 查看` }
+    }
+    const exact = byName(ref)
+    if (exact) return { session: exact }
+    const lower = ref.toLowerCase()
+    const matches = all.filter(x => x.name.toLowerCase().startsWith(lower))
+    if (matches.length === 1) return { session: matches[0] }
+    if (matches.length > 1) {
+      return { error: `${ref} 能匹配多个会话：${matches.map(x => `${x.num}.${x.name}`).join('、')}，用编号或写长一点` }
+    }
+    return { error: `没有名为 ${ref} 的会话，发 /list 查看` }
+  }
+
   function pushLog(entry) {
     const record = { seq: ++seq, ts: now(), ...entry }
     log.push(record)
@@ -28,10 +54,15 @@ export function createRelay({ now = () => Date.now() } = {}) {
     if (holder && holder.sessionId !== sessionId && isOnline(holder)) {
       return { ok: false, status: 409, error: `名字 ${name} 已被在线会话占用` }
     }
-    if (holder && holder.sessionId !== sessionId) sessions.delete(holder.sessionId)
+    let inherited
+    if (holder && holder.sessionId !== sessionId) {
+      inherited = holder.num
+      sessions.delete(holder.sessionId)
+    }
     const existing = sessions.get(sessionId)
     sessions.set(sessionId, {
       sessionId,
+      num: existing?.num ?? inherited ?? freeNumber(),
       name,
       cwd: cwd ?? '',
       version: version ?? '',
@@ -68,7 +99,10 @@ export function createRelay({ now = () => Date.now() } = {}) {
   }
 
   function list() {
-    return [...sessions.values()].map(s => ({
+    return [...sessions.values()]
+      .sort((a, b) => a.num - b.num)
+      .map(s => ({
+      num: s.num,
       name: s.name,
       cwd: s.cwd,
       version: s.version,
@@ -100,7 +134,7 @@ export function createRelay({ now = () => Date.now() } = {}) {
         rows.length === 0
           ? '没有已登记的会话'
           : rows
-              .map(r => `${r.current ? '*' : ' '} ${r.name}${r.online ? '' : '（离线）'}  ${r.cwd}`)
+              .map(r => `${r.current ? '*' : ' '} ${r.num}. ${r.name}${r.online ? '' : '（离线）'}  ${r.cwd}`)
               .join('\n'),
       )
       return
@@ -108,20 +142,20 @@ export function createRelay({ now = () => Date.now() } = {}) {
 
     const use = text.match(/^\/use\s+(\S+)$/)
     if (use) {
-      const s = byName(use[1])
-      if (!s) return tell(`没有名为 ${use[1]} 的会话，发 /list 查看`)
+      const { session: s, error } = resolve(use[1])
+      if (!s) return tell(error)
       target = s.sessionId
       return tell(`之后的消息默认发给 ${s.name}`)
     }
 
     if (text === '/help') {
-      return tell('/list 列出会话；/use <名字> 切换默认会话；@名字 内容 发给指定会话；其余内容发给默认会话')
+      return tell('/list 列出会话；/use 编号或名字 切换默认会话；@编号 内容 或 @名字前缀 内容 发给指定会话；其余内容发给上次的会话')
     }
 
     const at = text.match(/^@(\S+)\s+([\s\S]+)$/)
     if (at) {
-      const s = byName(at[1])
-      if (!s) return tell(`没有名为 ${at[1]} 的会话，发 /list 查看`)
+      const { session: s, error } = resolve(at[1])
+      if (!s) return tell(error)
       return deliver(s, at[2])
     }
 
@@ -130,7 +164,7 @@ export function createRelay({ now = () => Date.now() } = {}) {
       const online = [...sessions.values()].filter(isOnline)
       if (online.length === 1) s = online[0]
     }
-    if (!s) return tell('不确定发给哪个会话：先 /use <名字>，或用 @名字 开头。发 /list 查看')
+    if (!s) return tell('不确定发给哪个会话：先 /use 编号，或用 @编号 开头。发 /list 查看')
     deliver(s, text)
   }
 

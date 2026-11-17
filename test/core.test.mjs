@@ -59,7 +59,7 @@ test('/list 标出默认会话与离线会话', () => {
   relay.register({ sessionId: 's2', name: 'web', cwd: '/w/web' })
   relay.handleIncoming('/use web')
   relay.handleIncoming('/list')
-  assert.equal(lastReply(), '  api（离线）  /w/api\n* web  /w/web')
+  assert.equal(lastReply(), '  1. api（离线）  /w/api\n* 2. web  /w/web')
 })
 
 test('在线会话占用的名字不能被别的会话登记；离线后可以接手', () => {
@@ -112,4 +112,33 @@ test('注销后默认会话清空', () => {
   relay.handleIncoming('hi')
   assert.equal(relay.poll({ sessionId: 's2' }).messages[0]?.text, 'hi', '只剩一个在线会话时自动投给它')
   assert.equal(lastReply(), '→ web')
+})
+
+test('@编号、@唯一前缀、/use 编号都能定位会话；前缀有歧义时提示候选', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api-server', cwd: '' })
+  relay.register({ sessionId: 's2', name: 'api-worker', cwd: '' })
+  relay.register({ sessionId: 's3', name: 'web', cwd: '' })
+  relay.handleIncoming('@2 按编号')
+  relay.handleIncoming('@WE 按前缀，不分大小写')
+  relay.handleIncoming('@api 有歧义')
+  assert.match(lastReply(), /api 能匹配多个会话：1\.api-server、2\.api-worker/)
+  relay.handleIncoming('@9 不存在')
+  assert.match(lastReply(), /没有编号 9 的会话/)
+  relay.handleIncoming('/use 1')
+  relay.handleIncoming('默认会话')
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).messages.map(m => m.text), ['按编号'])
+  assert.deepEqual(relay.poll({ sessionId: 's3' }).messages.map(m => m.text), ['按前缀，不分大小写'])
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['默认会话'])
+})
+
+test('编号在会话登记期间不变；注销后空出的编号给新会话复用', () => {
+  const { relay } = setup()
+  relay.register({ sessionId: 's1', name: 'a', cwd: '' })
+  relay.register({ sessionId: 's2', name: 'b', cwd: '' })
+  relay.register({ sessionId: 's1', name: 'a2', cwd: '' })
+  assert.deepEqual(relay.list().map(r => [r.num, r.name]), [[1, 'a2'], [2, 'b']])
+  relay.unregister({ sessionId: 's1' })
+  relay.register({ sessionId: 's3', name: 'c', cwd: '' })
+  assert.deepEqual(relay.list().map(r => [r.num, r.name]), [[1, 'c'], [2, 'b']])
 })

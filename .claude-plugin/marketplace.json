@@ -1,0 +1,5 @@
+{
+  "name": "cc-im-bridge-local",
+  "owner": { "name": "jianxinliu" },
+  "plugins": [{ "name": "cc-im-bridge", "source": "./mod/cc-im-bridge" }]
+}
