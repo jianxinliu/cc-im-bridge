@@ -179,8 +179,25 @@ export function createWecomAdapter({
       log.warn(`企微：忽略白名单外用户 ${userId} 的卡片点击`)
       return
     }
-    const action = parseCardKey(body.event?.event_key)
-    if (!action) return
+    // 实测（2026-11-17）按钮 key 在 event.template_card_event 里；官方 SDK 类型写在 event 下，两处都认。
+    const detail = body.event?.template_card_event ?? {}
+    const eventKey = detail.event_key ?? body.event?.event_key
+    // 结论定了之后卡片上只剩一个灰色按钮，点它不做任何事。
+    if (/^appr:\d+:done$/.test(eventKey ?? '')) return
+    const action = parseCardKey(eventKey)
+    if (!action) {
+      log.warn(`企微：卡片点击无法识别 event_key=${JSON.stringify(eventKey)} 内层字段=${Object.keys(detail).join(',')}`)
+      return
+    }
+    // 审批编号每次启动中转都从 1 重新计，旧卡片的按钮 key 会和新审批撞上；
+    // 只认本次启动发出的卡片（task_id 带本次的随机前缀）。
+    const taskId = detail.task_id ?? body.event?.task_id
+    if (taskId !== `${taskPrefix}_${action.id}`) {
+      log.warn(`企微：忽略过期卡片的点击 task_id=${JSON.stringify(taskId)} key=${eventKey}`)
+      send('这张卡片已过期（中转重启过），不会生效，请用最新的卡片').catch(err => log.warn(`企微：${err.message}`))
+      return
+    }
+    log.log(`企微：卡片点击 #${action.id} ${action.approve ? '批准' : '拒绝'}`)
     const approval = onCardAction(action)
     const sent = approval && cards.get(action.id)
     if (!sent) return
@@ -198,7 +215,10 @@ export function createWecomAdapter({
   function handleFrame(frame) {
     if (frame.cmd === 'aibot_msg_callback') return handleCallback(frame)
     if (frame.cmd === 'aibot_event_callback') {
-      if (frame.body?.event?.eventtype === 'template_card_event') return handleCardEvent(frame)
+      const event = frame.body?.event ?? {}
+      // 只记事件类型与字段名，便于排查企微推送的形状；不记内容。
+      log.log(`企微：收到事件 ${event.eventtype ?? '(无类型)'} 字段=${Object.keys(event).join(',')} body字段=${Object.keys(frame.body ?? {}).join(',')}`)
+      if (event.eventtype === 'template_card_event') return handleCardEvent(frame)
       if (frame.body?.event?.eventtype === 'disconnected_event') {
         // 同一机器人建立了新连接，服务端会断开本连接；重连只会互相踢，所以停下等人处理。
         log.error('企微：同一机器人在别处建立了新连接，本中转已断开且不再重连。确认只有一个中转在用这个机器人后重启中转。')

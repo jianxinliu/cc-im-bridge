@@ -302,10 +302,17 @@ test('loadWecomConfig：缺文件返回 null；权限过宽、字段缺失时报
 const ackLast = s => s.serverSays({ headers: { req_id: s.lastSent().headers.req_id }, errcode: 0 })
 const tick = () => new Promise(r => setImmediate(r))
 const approval = { id: 3, name: 'api', tool: 'Bash', summary: 'npm publish' }
-const cardEvent = (from, key, extra = {}) => ({
+// 按企微实测的形状：按钮 key 与 task_id 在 event.template_card_event 里。
+const cardEvent = (from, key, extra = {}, taskId = 't') => ({
   cmd: 'aibot_event_callback',
   headers: { req_id: `evt_${Math.random()}` },
-  body: { msgid: `e_${Math.random()}`, from: { userid: from }, msgtype: 'event', event: { eventtype: 'template_card_event', event_key: key, task_id: 't' }, ...extra },
+  body: {
+    msgid: `e_${Math.random()}`,
+    from: { userid: from },
+    msgtype: 'event',
+    event: { eventtype: 'template_card_event', template_card_event: { card_type: 'button_interaction', event_key: key, task_id: taskId } },
+    ...extra,
+  },
 })
 
 test('审批卡片：带批准/拒绝按钮，标题写会话名与编号', () => {
@@ -376,7 +383,8 @@ test('点批准按钮：交给中转决定，并用事件的 req_id 把卡片更
   ackLast(socket())
   await sending
 
-  const evt = cardEvent('alice', 'appr:3:y')
+  const taskId = socket().sent.find(f => f.body?.msgtype === 'template_card').body.template_card.task_id
+  const evt = cardEvent('alice', 'appr:3:y', {}, taskId)
   socket().serverSays(evt)
   assert.deepEqual(actions, [{ id: 3, approve: true }])
   const update = socket().lastSent()
@@ -410,10 +418,49 @@ test('卡片更新失败时补发一条文字结论', async () => {
   await tick()
   ackLast(socket())
   await sending
-  const evt = cardEvent('alice', 'appr:3:y')
+  const taskId = socket().sent.find(f => f.body?.msgtype === 'template_card').body.template_card.task_id
+  const evt = cardEvent('alice', 'appr:3:y', {}, taskId)
   socket().serverSays(evt)
   socket().serverSays({ headers: { req_id: evt.headers.req_id }, errcode: 60020, errmsg: 'expired' })
   await tick()
   await tick()
   assert.equal(socket().lastSent().body.markdown.content, '#3 · Bash · 已批准')
+})
+
+test('卡片点击：旧卡片（中转重启前发的，编号撞上）不生效，并提示已过期', async () => {
+  const actions = []
+  const { socket, authOk } = setup({ onCardAction: a => (actions.push(a), null) })
+  authOk()
+  socket().serverSays(textFrame('alice', 'hi'))
+  socket().serverSays({
+    cmd: 'aibot_event_callback',
+    headers: { req_id: 'evt_nested' },
+    body: {
+      msgid: 'nested1',
+      from: { userid: 'alice' },
+      msgtype: 'event',
+      event: { eventtype: 'template_card_event', template_card_event: { card_type: 'button_interaction', event_key: 'appr:5:n', task_id: 'ccim_x_5' } },
+    },
+  })
+  assert.deepEqual(actions, [], 'task_id 不是本次启动发的卡片，不认')
+  await tick()
+  assert.match(socket().lastSent()?.body?.markdown?.content ?? '', /卡片已过期/)
+})
+
+test('卡片点击：旧版 SDK 写法（key 直接在 event 下）也能识别', async () => {
+  const actions = []
+  const { socket, authOk, adapter } = setup({ onCardAction: a => (actions.push(a), null) })
+  authOk()
+  socket().serverSays(textFrame('alice', 'hi'))
+  const sending = adapter.sendApprovalCard(approval, 'x')
+  await tick()
+  const taskId = socket().lastSent().body.template_card.task_id
+  ackLast(socket())
+  await sending
+  socket().serverSays({
+    cmd: 'aibot_event_callback',
+    headers: { req_id: 'evt_flat' },
+    body: { msgid: 'flat1', from: { userid: 'alice' }, msgtype: 'event', event: { eventtype: 'template_card_event', event_key: 'appr:3:n', task_id: taskId } },
+  })
+  assert.deepEqual(actions, [{ id: 3, approve: false }])
 })
