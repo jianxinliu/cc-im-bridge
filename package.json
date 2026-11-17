@@ -1,0 +1,9 @@
+{
+  "name": "cc-im-bridge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "relay": "node relay/relay.mjs",
+    "test": "node --test test/*.test.mjs && claude plugin test mod/cc-im-bridge"
+  }
+}

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>cc-im-bridge</title>
+<style>
+  body { margin: 0; font: 14px/1.5 -apple-system, "PingFang SC", sans-serif; background: #f2f2f2; display: flex; flex-direction: column; height: 100vh; }
+  header { padding: 10px 16px; background: #2b2b2b; color: #eee; font-weight: 600; }
+  header span { font-weight: 400; color: #999; margin-left: 8px; font-size: 12px; }
+  #log { flex: 1; overflow-y: auto; padding: 16px; }
+  .row { display: flex; margin: 6px 0; }
+  .row.in { justify-content: flex-end; }
+  .bubble { max-width: 70%; padding: 8px 12px; border-radius: 6px; background: #fff; white-space: pre-wrap; word-break: break-word; }
+  .in .bubble { background: #95ec69; }
+  .relay .bubble { background: transparent; color: #888; font-size: 12px; padding: 2px 4px; }
+  .from { font-size: 12px; color: #888; margin-bottom: 2px; }
+  form { display: flex; gap: 8px; padding: 10px 16px; background: #fff; border-top: 1px solid #ddd; }
+  textarea { flex: 1; resize: none; height: 48px; font: inherit; padding: 6px; }
+  button { padding: 0 18px; }
+</style>
+</head>
+<body>
+<header>cc-im-bridge<span>/list · /use 名字 · @名字 内容 · Enter 发送</span></header>
+<div id="log"></div>
+<form id="f"><textarea id="t" placeholder="发消息"></textarea><button>发送</button></form>
+<script>
+  const token = new URLSearchParams(location.search).get('token')
+  const headers = { 'x-token': token, 'content-type': 'application/json' }
+  const log = document.getElementById('log')
+  let since = 0
+
+  function add(e) {
+    const kind = e.dir === 'in' ? 'in' : e.from === 'relay' ? 'relay' : 'out'
+    const row = document.createElement('div')
+    row.className = 'row ' + kind
+    const box = document.createElement('div')
+    if (kind === 'out') {
+      const from = document.createElement('div')
+      from.className = 'from'
+      from.textContent = e.from
+      box.append(from)
+    }
+    const bubble = document.createElement('div')
+    bubble.className = 'bubble'
+    bubble.textContent = e.text
+    box.append(bubble)
+    row.append(box)
+    log.append(row)
+    log.scrollTop = log.scrollHeight
+  }
+
+  async function pull() {
+    try {
+      const r = await fetch('/api/events?since=' + since, { headers })
+      const { events = [] } = await r.json()
+      for (const e of events) { add(e); since = e.seq }
+    } catch (err) {
+      console.error('拉取消息失败', err)
+    }
+  }
+  setInterval(pull, 1000)
+  pull()
+
+  const t = document.getElementById('t')
+  async function submit(ev) {
+    ev?.preventDefault()
+    const text = t.value.trim()
+    if (!text) return
+    t.value = ''
+    await fetch('/api/send', { method: 'POST', headers, body: JSON.stringify({ text }) })
+    pull()
+  }
+  document.getElementById('f').addEventListener('submit', submit)
+  t.addEventListener('keydown', ev => { if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) submit(ev) })
+</script>
+</body>
+</html>
