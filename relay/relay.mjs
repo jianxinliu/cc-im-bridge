@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url'
 
 import { createRelay } from './core.mjs'
 import { createWecomAdapter, formatOutgoing, loadWecomConfig } from './wecom.mjs'
+import { MiniWebSocket } from './ws-client.mjs'
 
 const HOME = process.env.CC_IM_HOME ?? join(homedir(), '.cc-im-bridge')
 const SOCKET = join(HOME, 'relay.sock')
@@ -162,6 +163,7 @@ try {
     wecom = createWecomAdapter({
       ...config,
       initialChatId,
+      WebSocketImpl: MiniWebSocket,
       onText: text => relay.handleIncoming(text),
       onChatId: chatId => writeFileSync(WECOM_STATE, JSON.stringify({ chatId }) + '\n', { mode: 0o600 }),
     })
