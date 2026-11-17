@@ -1,7 +1,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
-const VERSION = '0.2.0'
+const VERSION = '0.2.1'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
 const NAME_PATTERN = /^[\w.\-一-龥]{1,32}$/
@@ -13,6 +13,9 @@ const MAX_APPROVAL_POLLS = 24
 const MAX_SUMMARY_CHARS = 1000
 // 这两类必须本人在本地操作，hook 的 allow 关不掉对话框（见 ToolCheckResult.decision 的说明）。
 const PERSON_ONLY_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode'])
+// 只在会弹框问人的权限模式下转发。auto 模式的 ask 本该由分类器决定，转出去会把每次调用都推到 IM；
+// bypassPermissions、dontAsk 不问人。还没读到模式时也不转，保持本地原样。
+const FORWARD_MODES = new Set(['default', 'acceptEdits', 'plan'])
 
 type PushMode = 'im' | 'all' | 'off'
 type RelayAnswer = {
@@ -42,6 +45,8 @@ const bridge = {
   currentTurnId: '',
   // 开启后本地发起的回合也把审批转到 IM。
   isAway: false,
+  // 从经典钩子事件的公共字段 permission_mode 读到的当前权限模式。
+  permissionMode: '',
 }
 
 const describe = (err: unknown) => (err instanceof Error ? err.message : String(err))
@@ -214,6 +219,7 @@ function summarize(input: unknown) {
 
 function shouldAskViaIm(tool: string, toolUseId: string | undefined) {
   if (!toolUseId || !bridge.isRegistered || PERSON_ONLY_TOOLS.has(tool)) return false
+  if (!FORWARD_MODES.has(bridge.permissionMode)) return false
   return bridge.isAway || bridge.imTurnIds.has(bridge.currentTurnId)
 }
 
@@ -259,6 +265,7 @@ function statusText() {
     `状态：${bridge.problem ?? (bridge.isRegistered ? '已连接' : '未连接')}`,
     `回传：${bridge.pushMode}`,
     `离开模式：${bridge.isAway ? 'on' : 'off'}`,
+    `权限模式：${bridge.permissionMode || '未知'}（${FORWARD_MODES.has(bridge.permissionMode) ? '会' : '不会'}转发审批）`,
   ].join('\n')
 }
 
@@ -287,6 +294,18 @@ export const register: Register = on => {
       await forwardAnswer($, e.turnId, e.answer, e.isAborted)
     }
     return done
+  })
+
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    if (e.permission_mode) bridge.permissionMode = e.permission_mode
+    return next(e)
+  })
+
+  on('classic.PreToolUse', async ($, e, next) => {
+    // 公共字段在运行时都有，但按工具收窄后的类型没有列出，所以按通用形状读。
+    const mode = (e as { permission_mode?: string }).permission_mode
+    if (mode) bridge.permissionMode = mode
+    return next(e)
   })
 
   // 引擎判定要问人时，若人可能不在电脑前，就把这次审批转到 IM；IM 没答复则照常本地弹框。

@@ -33,6 +33,7 @@ function engineBeneath(on: On, sessionId = 'abcd1234-session') {
     return { text: e.text }
   })
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('classic.UserPromptSubmit', () => ({}))
   on('turn.complete', (_, e) => ({ text: e.answer }))
   mock.store(on)
   mock.env(on, { HOME: '/Users/me' })
@@ -59,7 +60,7 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.2.0' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.2.1' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
@@ -181,7 +182,8 @@ function approvalRelay(on: On, states: string[], reason = '') {
   return { calls, waitCount: () => waits }
 }
 
-async function inImTurn($: Engine) {
+async function inImTurn($: Engine, mode = 'default') {
+  await $.classic.UserPromptSubmit({ prompt: '部署一下', permission_mode: mode })
   await $.turn.start({ text: '[来自 IM 的消息，本轮最终回复会自动发回 IM，请简洁]\n部署一下', turnId: 'im1' })
 }
 
@@ -221,6 +223,7 @@ test('审批：本地发起的回合默认不转；/im-away on 后转', async ($
   const { clock } = engineBeneath(on)
   await startSession($)
   await clock.advance(2000)
+  await $.classic.UserPromptSubmit({ prompt: '本地的提问', permission_mode: 'default' })
   await $.turn.start({ text: '本地的提问', turnId: 'local1' })
 
   const before = await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: 'tu1' })
@@ -274,4 +277,25 @@ test('审批：中转出错时交回本地，不卡住', async ($, on) => {
   const verdict = await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: 'tu1' })
   expect(verdict.decision).toBe('ask')
   expect(statuses.at(-1)).toContain('审批转发失败：boom')
+})
+
+test('审批：auto、bypassPermissions、dontAsk 和未知模式下不转（交给分类器或本地原样）', async ($, on) => {
+  const { calls } = approvalRelay(on, ['approved'])
+  on('tool.check', () => ({ decision: 'ask' as const }))
+  const { clock } = engineBeneath(on)
+  await startSession($)
+  await clock.advance(2000)
+
+  await $.turn.start({ text: '[来自 IM 的消息，本轮最终回复会自动发回 IM，请简洁]\n未知模式', turnId: 'im0' })
+  expect((await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: 'tu0' })).decision).toBe('ask')
+
+  for (const mode of ['auto', 'bypassPermissions', 'dontAsk']) {
+    await inImTurn($, mode)
+    const verdict = await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: `tu-${mode}` })
+    expect(verdict.decision).toBe('ask')
+  }
+  expect(calls.some(c => c.path === '/mod/approval/request')).toBe(false)
+
+  await inImTurn($, 'acceptEdits')
+  expect((await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: 'tu-ae' })).decision).toBe('allow')
 })
