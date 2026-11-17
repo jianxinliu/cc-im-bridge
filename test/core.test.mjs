@@ -202,3 +202,39 @@ test('审批：未登记会话、缺 tool、不存在的编号返回错误', () 
   assert.equal(relay.getApproval({ id: 99 }).status, 404)
   assert.equal(relay.cancelApproval({ id: 99 }).status, 404)
 })
+
+test('钩子问审批：未登记、离线、没开转发的会话答「不转」；开了才建审批', () => {
+  const { relay, clock, lastReply } = setup()
+  assert.deepEqual(relay.hookPermission({ sessionId: 'nope', tool: 'Bash', summary: 'ls' }), { ok: true, forward: false })
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  assert.equal(relay.hookPermission({ sessionId: 's1', tool: 'Bash', summary: 'ls' }).forward, false)
+
+  relay.poll({ sessionId: 's1', forward: true })
+  const r = relay.hookPermission({ sessionId: 's1', tool: 'Bash', summary: 'ls' })
+  assert.equal(r.forward, true)
+  assert.match(lastReply(), new RegExp(`请求批准 #${r.id}`))
+
+  clock.advance(ONLINE_WINDOW_MS + 1)
+  assert.equal(relay.hookPermission({ sessionId: 's1', tool: 'Bash', summary: 'ls' }).forward, false, '离线不转')
+  relay.setForward({ sessionId: 's1', forward: false })
+  relay.poll({ sessionId: 's1' })
+  assert.equal(relay.hookPermission({ sessionId: 's1', tool: 'Bash', summary: 'ls' }).forward, false, 'poll 不带 forward 时保留原值')
+})
+
+test('在电脑上处理后作废审批：按工具与摘要只作废对得上的；不带条件作废全部', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.register({ sessionId: 's2', name: 'web', cwd: '' })
+  const a = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'ls' })
+  const b = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'rm x' })
+  const c = relay.requestApproval({ sessionId: 's2', tool: 'Bash', summary: 'ls' })
+
+  assert.equal(relay.settleLocal({ sessionId: 's1', tool: 'Bash', summary: 'ls' }).cancelled, 1)
+  assert.match(lastReply(), new RegExp(`审批 #${a.id} 已在电脑上处理`))
+  assert.equal(relay.getApproval({ id: b.id }).approval.state, 'pending')
+
+  relay.handleIncoming(`/y ${b.id}`)
+  assert.equal(relay.settleLocal({ sessionId: 's1' }).cancelled, 0, '已答复的不动')
+  assert.equal(relay.getApproval({ id: b.id }).approval.state, 'approved')
+  assert.equal(relay.getApproval({ id: c.id }).approval.state, 'pending', '别的会话不动')
+})

@@ -61,6 +61,9 @@ const modRoutes = {
   'POST /mod/reply': relay.reply,
   'POST /mod/approval/request': relay.requestApproval,
   'POST /mod/approval/cancel': relay.cancelApproval,
+  'POST /mod/forward': relay.setForward,
+  'POST /mod/approval/settle-local': relay.settleLocal,
+  'POST /hook/permission': relay.hookPermission,
 }
 
 // 长轮询：审批还在待批时最多挂 WAIT_MAX_MS，有结果立即返回；mod 那边循环调用。

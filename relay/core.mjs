@@ -74,6 +74,7 @@ export function createRelay({ now = () => Date.now() } = {}) {
       version: version ?? '',
       lastSeen: now(),
       queue: existing?.queue ?? [],
+      forward: existing?.forward ?? false,
     })
     return { ok: true, name }
   }
@@ -86,11 +87,12 @@ export function createRelay({ now = () => Date.now() } = {}) {
     return { ok: true }
   }
 
-  // 会话取信，同时视为心跳。
-  function poll({ sessionId }) {
+  // 会话取信，同时上报「需要批准时是否转到 IM」（IM 发起的回合或离开模式下为 true）。
+  function poll({ sessionId, forward }) {
     const s = sessions.get(sessionId)
     if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
     s.lastSeen = now()
+    if (typeof forward === 'boolean') s.forward = forward
     const messages = s.queue.splice(0)
     return { ok: true, messages }
   }
@@ -222,6 +224,35 @@ export function createRelay({ now = () => Date.now() } = {}) {
   }
 
   // 会话那边不再等了（本地处理、中断、超时），作废这条审批。
+  function setForward({ sessionId, forward }) {
+    const s = sessions.get(sessionId)
+    if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
+    s.forward = Boolean(forward)
+    return { ok: true }
+  }
+
+  // settings 的 PermissionRequest 钩子来问：这个会话现在要不要把审批转到 IM。
+  // 未登记、离线或没开转发的会话直接答「不转」，让本地照常弹框。
+  function hookPermission({ sessionId, tool, summary }) {
+    const s = sessions.get(sessionId)
+    if (!s || !isOnline(s) || !s.forward) return { ok: true, forward: false }
+    return { ...requestApproval({ sessionId, tool, summary }), forward: true }
+  }
+
+  // 工具已经开始运行（说明已在电脑上批准）或回合已结束时，作废这个会话还挂着的审批。
+  // 给了 tool 和 summary 时只作废对得上的那条，避免并行的其他审批被误伤。
+  function settleLocal({ sessionId, tool, summary }) {
+    let count = 0
+    for (const a of approvals.values()) {
+      if (a.sessionId !== sessionId || a.status !== 'pending') continue
+      if (tool !== undefined && (a.tool !== tool || a.summary !== summary)) continue
+      settle(a, 'cancelled', '已在电脑上处理')
+      tell(`审批 #${a.id} 已在电脑上处理，无需再回复`)
+      count++
+    }
+    return { ok: true, cancelled: count }
+  }
+
   function cancelApproval({ id, why }) {
     const a = approvals.get(Number(id))
     if (!a) return { ok: false, status: 404, error: `没有审批 #${id}` }
@@ -271,5 +302,8 @@ export function createRelay({ now = () => Date.now() } = {}) {
     getApproval,
     cancelApproval,
     onApprovalChange,
+    setForward,
+    hookPermission,
+    settleLocal,
   }
 }

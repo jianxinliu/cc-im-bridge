@@ -1,21 +1,15 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
-const VERSION = '0.2.1'
+const VERSION = '0.3.0'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
 const NAME_PATTERN = /^[\w.\-一-龥]{1,32}$/
 // 提交进会话的 IM 消息都带这个开头；回合开始时据此认出由 IM 发起的回合。
 const IM_MARKER = '[来自 IM 的消息'
-// 审批等待：中转每次最多挂 25 秒，循环 24 次约 10 分钟；按次数而非时钟计，中转异常地立即返回时也会结束。
-const LONG_POLL_MS = 25_000
-const MAX_APPROVAL_POLLS = 24
+// 与仓库 relay/summary.mjs 一致：审批摘要，用来作废「已在电脑上处理」的那条审批。
 const MAX_SUMMARY_CHARS = 1000
-// 这两类必须本人在本地操作，hook 的 allow 关不掉对话框（见 ToolCheckResult.decision 的说明）。
-const PERSON_ONLY_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode'])
-// 只在会弹框问人的权限模式下转发。auto 模式的 ask 本该由分类器决定，转出去会把每次调用都推到 IM；
-// bypassPermissions、dontAsk 不问人。还没读到模式时也不转，保持本地原样。
-const FORWARD_MODES = new Set(['default', 'acceptEdits', 'plan'])
+const SUMMARY_FIELDS = ['command', 'file_path', 'url', 'path', 'pattern']
 
 type PushMode = 'im' | 'all' | 'off'
 type RelayAnswer = {
@@ -23,10 +17,7 @@ type RelayAnswer = {
   ok: boolean
   error?: string
   messages?: { text: string }[]
-  id?: number
-  approval?: { id: number; state: string; reason: string }
 }
-type ImVerdict = { decision: 'allow' | 'deny'; reason: string }
 
 // 模块每个会话加载一份，这里的状态就是本会话的状态；重载后由 session.start 重新填。
 const bridge = {
@@ -41,13 +32,14 @@ const bridge = {
   // 由 IM 消息开启、还没结束的回合 id：这些回合的回复要发回 IM。
   // 按回合 id 认，而不是在取信时计数：取信时上一回合可能还没结束。
   imTurnIds: new Set<string>(),
-  // 主循环当前回合；审批时据此判断这一回合是不是 IM 发起的（人可能不在电脑前）。
-  currentTurnId: '',
+  // 主循环当前回合是不是 IM 发起的：是的话人可能不在电脑前，审批要转到 IM。
+  isImTurn: false,
   // 开启后本地发起的回合也把审批转到 IM。
   isAway: false,
-  // 从经典钩子事件的公共字段 permission_mode 读到的当前权限模式。
-  permissionMode: '',
 }
+
+// 审批真正发生在 settings 的 PermissionRequest 钩子里；mod 只告诉中转现在该不该转。
+const shouldForward = () => bridge.isAway || bridge.isImTurn
 
 const describe = (err: unknown) => (err instanceof Error ? err.message : String(err))
 
@@ -88,7 +80,7 @@ async function tick($: EngineInterface) {
   bridge.isPolling = true
   try {
     if (!bridge.isRegistered) await ensureRegistered($)
-    const r = await call($, '/mod/poll', { sessionId: bridge.sessionId })
+    const r = await call($, '/mod/poll', { sessionId: bridge.sessionId, forward: shouldForward() })
     if (r.status === 404) {
       // 中转重启后登记表清空，下一轮重新登记。
       bridge.isRegistered = false
@@ -211,40 +203,26 @@ async function stop($: EngineInterface) {
 function summarize(input: unknown) {
   const fields = (input ?? {}) as Record<string, unknown>
   const text =
-    ['command', 'file_path', 'url', 'path', 'pattern']
-      .map(k => fields[k])
-      .find((v): v is string => typeof v === 'string') ?? JSON.stringify(input ?? {})
+    SUMMARY_FIELDS.map(k => fields[k]).find((v): v is string => typeof v === 'string') ?? JSON.stringify(input ?? {})
   return text.length > MAX_SUMMARY_CHARS ? `${text.slice(0, MAX_SUMMARY_CHARS)}…` : text
 }
 
-function shouldAskViaIm(tool: string, toolUseId: string | undefined) {
-  if (!toolUseId || !bridge.isRegistered || PERSON_ONLY_TOOLS.has(tool)) return false
-  if (!FORWARD_MODES.has(bridge.permissionMode)) return false
-  return bridge.isAway || bridge.imTurnIds.has(bridge.currentTurnId)
+// 转发状态变化时立即告诉中转，不等下一次取信；失败无妨，下一次取信会带上。
+async function pushForward($: EngineInterface) {
+  if (!bridge.isRegistered) return
+  try {
+    await call($, '/mod/forward', { sessionId: bridge.sessionId, forward: shouldForward() })
+  } catch (err) {
+    report($, describe(err))
+  }
 }
 
-// 把审批发到 IM 并等答复；没等到（超时、中断、中转出错）返回 undefined，交回本地审批。
-async function askViaIm($: EngineInterface, tool: string, input: unknown, signal: AbortSignal): Promise<ImVerdict | undefined> {
-  const req = await call($, '/mod/approval/request', { sessionId: bridge.sessionId, tool, summary: summarize(input) })
-  if (!req.ok || req.id === undefined) {
-    report($, `审批转发失败：${req.error ?? req.status}`)
-    return undefined
-  }
-  const id = req.id
-  $.ui.status(`IM：等待 IM 审批 #${id}`)
+async function settleLocal($: EngineInterface, body: { tool?: string; summary?: string }) {
+  if (!bridge.isRegistered) return
   try {
-    for (let i = 0; i < MAX_APPROVAL_POLLS && !signal.aborted; i++) {
-      const r = await call($, '/mod/approval/wait', { id, timeoutMs: LONG_POLL_MS })
-      if (!r.ok || !r.approval) throw new Error(`查询审批 #${id} 失败：${r.error ?? r.status}`)
-      const { state, reason } = r.approval
-      if (state === 'approved') return { decision: 'allow', reason: `用户已在 IM 批准（#${id}）` }
-      if (state === 'denied') return { decision: 'deny', reason: `用户在 IM 拒绝了（#${id}）${reason ? `：${reason}` : ''}` }
-      if (state !== 'pending') return undefined
-    }
-    await call($, '/mod/approval/cancel', { id, why: signal.aborted ? '会话已中断' : '10 分钟未答复，转回电脑上审批' })
-    return undefined
-  } finally {
-    $.ui.status(`IM：${bridge.name}`)
+    await call($, '/mod/approval/settle-local', { sessionId: bridge.sessionId, ...body })
+  } catch (err) {
+    report($, describe(err))
   }
 }
 
@@ -254,6 +232,7 @@ async function setAway($: EngineInterface, wanted: string) {
   }
   bridge.isAway = wanted === 'on'
   await $.store.set(`away:${bridge.sessionId}`, bridge.isAway)
+  await pushForward($)
   return bridge.isAway ? '已开启：需要批准时都会发到 IM' : '已关闭：只有 IM 发起的回合会把审批发到 IM'
 }
 
@@ -265,7 +244,7 @@ function statusText() {
     `状态：${bridge.problem ?? (bridge.isRegistered ? '已连接' : '未连接')}`,
     `回传：${bridge.pushMode}`,
     `离开模式：${bridge.isAway ? 'on' : 'off'}`,
-    `权限模式：${bridge.permissionMode || '未知'}（${FORWARD_MODES.has(bridge.permissionMode) ? '会' : '不会'}转发审批）`,
+    `审批转发：${shouldForward() ? '开（需要批准时发到 IM）' : '关'}`,
   ].join('\n')
 }
 
@@ -281,8 +260,9 @@ export const register: Register = on => {
 
   on('turn.start', async ($, e, next) => {
     if (!e.agentId) {
-      bridge.currentTurnId = e.turnId
-      if (e.text.includes(IM_MARKER)) bridge.imTurnIds.add(e.turnId)
+      bridge.isImTurn = e.text.includes(IM_MARKER)
+      if (bridge.isImTurn) bridge.imTurnIds.add(e.turnId)
+      await pushForward($)
     }
     return next(e)
   })
@@ -290,31 +270,22 @@ export const register: Register = on => {
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (!e.agentId) {
-      if (bridge.currentTurnId === e.turnId) bridge.currentTurnId = ''
+      bridge.isImTurn = false
+      await pushForward($)
+      await settleLocal($, {})
       await forwardAnswer($, e.turnId, e.answer, e.isAborted)
     }
     return done
   })
 
-  on('classic.UserPromptSubmit', async ($, e, next) => {
-    if (e.permission_mode) bridge.permissionMode = e.permission_mode
+  // 工具开始运行说明已获批准；若这是在电脑上批的，作废 IM 里对应那条还在等的审批。
+  on('tool.call', async ($, e, next) => {
+    if (!e.agentId && e.tool !== 'mcp__cc-im-bridge__send') {
+      const { tool, tool_use_id: _id, agentId: _agent, ...input } = e as unknown as Record<string, unknown>
+      void settleLocal($, { tool: String(tool), summary: summarize(input) })
+    }
     return next(e)
   })
-
-  on('classic.PreToolUse', async ($, e, next) => {
-    // 公共字段在运行时都有，但按工具收窄后的类型没有列出，所以按通用形状读。
-    const mode = (e as { permission_mode?: string }).permission_mode
-    if (mode) bridge.permissionMode = mode
-    return next(e)
-  })
-
-  // 引擎判定要问人时，若人可能不在电脑前，就把这次审批转到 IM；IM 没答复则照常本地弹框。
-  on('tool.check', async ($, e, next) => {
-    const verdict = await next(e)
-    if (verdict.decision !== 'ask' || !shouldAskViaIm(e.tool, e.tool_use_id)) return verdict
-    const answer = await askViaIm($, e.tool, e.input, next.signal)
-    return answer ?? verdict
-  }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'im-status' }, async () => ({ text: statusText() }))
   on('command.run', { command: 'im-name' }, async ($, e) => ({ text: await rename($, e.args.trim()) }))

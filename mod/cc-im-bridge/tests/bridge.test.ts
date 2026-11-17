@@ -33,7 +33,6 @@ function engineBeneath(on: On, sessionId = 'abcd1234-session') {
     return { text: e.text }
   })
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
-  on('classic.UserPromptSubmit', () => ({}))
   on('turn.complete', (_, e) => ({ text: e.answer }))
   mock.store(on)
   mock.env(on, { HOME: '/Users/me' })
@@ -60,7 +59,7 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.2.1' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.3.0' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
@@ -168,134 +167,57 @@ test('取信时上一轮还在跑：上一轮的回复不发 IM，IM 那一轮�
   expect(replies).toEqual(['收到，链路正常'])
 })
 
-// 审批测试的公共准备：中转替身里 /mod/approval/wait 按给定序列返回状态。
-function approvalRelay(on: On, states: string[], reason = '') {
-  let waits = 0
-  const calls = fakeRelay(on, {
-    '/mod/poll': () => ({ ok: true, messages: [] }),
-    '/mod/approval/request': () => ({ ok: true, id: 7 }),
-    '/mod/approval/wait': () => {
-      const state = states[Math.min(waits++, states.length - 1)] ?? 'pending'
-      return { ok: true, approval: { id: 7, state, reason } }
-    },
-  })
-  return { calls, waitCount: () => waits }
-}
+const IM_PROMPT = '[来自 IM 的消息，本轮最终回复会自动发回 IM，请简洁]\n部署一下'
+const forwardFlags = (calls: Call[]) => calls.filter(c => c.path === '/mod/forward').map(c => c.body.forward)
 
-async function inImTurn($: Engine, mode = 'default') {
-  await $.classic.UserPromptSubmit({ prompt: '部署一下', permission_mode: mode })
-  await $.turn.start({ text: '[来自 IM 的消息，本轮最终回复会自动发回 IM，请简洁]\n部署一下', turnId: 'im1' })
-}
-
-test('审批：IM 发起的回合里，要问人时转到 IM，批准后放行', async ($, on) => {
-  const { calls } = approvalRelay(on, ['pending', 'approved'])
-  on('tool.check', () => ({ decision: 'ask' as const }))
+test('审批转发：IM 发起的回合开始时打开转发，结束时关闭并作废未答复的审批', async ($, on) => {
+  const calls = fakeRelay(on, { '/mod/poll': () => ({ ok: true, messages: [] }) })
   const { clock } = engineBeneath(on)
   await startSession($)
   await clock.advance(2000)
-  await inImTurn($)
+  expect(calls.find(c => c.path === '/mod/poll')?.body.forward).toBe(false)
 
-  const verdict = await $.tool.check({ tool: 'Bash', input: { command: 'npm publish' }, tool_use_id: 'tu1' })
-  expect(verdict.decision).toBe('allow')
-  expect(calls.find(c => c.path === '/mod/approval/request')?.body).toEqual({
+  await $.turn.start({ text: IM_PROMPT, turnId: 'im1' })
+  await clock.advance(2000)
+  expect(calls.filter(c => c.path === '/mod/poll').at(-1)?.body.forward).toBe(true)
+
+  await $.turn.complete({ answer: '好了', durationMs: 1, isAborted: false, turnId: 'im1', reason: 'answer' })
+  expect(forwardFlags(calls)).toEqual([true, false])
+  expect(calls.find(c => c.path === '/mod/approval/settle-local')?.body).toEqual({ sessionId: 'abcd1234-session' })
+})
+
+test('审批转发：本地发起的回合不转；/im-away on 后转', async ($, on) => {
+  const calls = fakeRelay(on, { '/mod/poll': () => ({ ok: true, messages: [] }) })
+  const { clock } = engineBeneath(on)
+  await startSession($)
+  await clock.advance(2000)
+
+  await $.turn.start({ text: '本地的提问', turnId: 'l1' })
+  await $.command.run({ command: 'im-away', args: 'on' })
+  await $.turn.start({ text: '本地的提问', turnId: 'l2' })
+  expect(forwardFlags(calls)).toEqual([false, true, true])
+
+  const status = await $.command.run({ command: 'im-status', args: '' })
+  expect(status.text).toContain('审批转发：开')
+})
+
+test('审批转发：工具开始运行时，按工具和摘要作废 IM 里那条（摘要与 relay/summary.mjs 一致）', async ($, on) => {
+  const calls = fakeRelay(on, { '/mod/poll': () => ({ ok: true, messages: [] }) })
+  on('tool.call', () => ({ result: {} }))
+  const { clock } = engineBeneath(on)
+  await startSession($)
+  await clock.advance(2000)
+
+  await $.tool.call({ tool: 'Bash', command: 'npm publish', description: '发版' })
+  await clock.settle()
+  expect(calls.filter(c => c.path === '/mod/approval/settle-local').at(-1)?.body).toEqual({
     sessionId: 'abcd1234-session',
     tool: 'Bash',
     summary: 'npm publish',
   })
-})
 
-test('审批：IM 拒绝时带上原因', async ($, on) => {
-  approvalRelay(on, ['denied'], '先别发版')
-  on('tool.check', () => ({ decision: 'ask' as const }))
-  const { clock } = engineBeneath(on)
-  await startSession($)
-  await clock.advance(2000)
-  await inImTurn($)
-
-  const verdict = await $.tool.check({ tool: 'Bash', input: { command: 'npm publish' }, tool_use_id: 'tu1' })
-  expect(verdict.decision).toBe('deny')
-  expect(verdict.reason).toBe('用户在 IM 拒绝了（#7）：先别发版')
-})
-
-test('审批：本地发起的回合默认不转；/im-away on 后转', async ($, on) => {
-  const { calls } = approvalRelay(on, ['approved'])
-  on('tool.check', () => ({ decision: 'ask' as const }))
-  const { clock } = engineBeneath(on)
-  await startSession($)
-  await clock.advance(2000)
-  await $.classic.UserPromptSubmit({ prompt: '本地的提问', permission_mode: 'default' })
-  await $.turn.start({ text: '本地的提问', turnId: 'local1' })
-
-  const before = await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: 'tu1' })
-  expect(before.decision).toBe('ask')
-  expect(calls.some(c => c.path === '/mod/approval/request')).toBe(false)
-
-  await $.command.run({ command: 'im-away', args: 'on' })
-  const after = await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: 'tu2' })
-  expect(after.decision).toBe('allow')
-})
-
-test('审批：一直没人答复，轮询有上限，作废后交回本地', async ($, on) => {
-  const { calls, waitCount } = approvalRelay(on, ['pending'])
-  on('tool.check', () => ({ decision: 'ask' as const }))
-  const { clock } = engineBeneath(on)
-  await startSession($)
-  await clock.advance(2000)
-  await inImTurn($)
-
-  const verdict = await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: 'tu1' })
-  expect(verdict.decision).toBe('ask')
-  expect(waitCount()).toBe(24)
-  expect(calls.at(-1)).toEqual({ path: '/mod/approval/cancel', body: { id: 7, why: '10 分钟未答复，转回电脑上审批' } })
-})
-
-test('审批：引擎已放行、必须本人操作的工具、只是查询（无 tool_use_id）都不转', async ($, on) => {
-  const { calls } = approvalRelay(on, ['approved'])
-  on('tool.check', (_, e) => ({ decision: e.tool === 'Read' ? ('allow' as const) : ('ask' as const) }))
-  const { clock } = engineBeneath(on)
-  await startSession($)
-  await clock.advance(2000)
-  await inImTurn($)
-
-  expect((await $.tool.check({ tool: 'Read', input: { file_path: '/a' }, tool_use_id: 'tu1' })).decision).toBe('allow')
-  expect((await $.tool.check({ tool: 'AskUserQuestion', input: {}, tool_use_id: 'tu2' })).decision).toBe('ask')
-  expect((await $.tool.check({ tool: 'Bash', input: { command: 'ls' } })).decision).toBe('ask')
-  expect(calls.some(c => c.path === '/mod/approval/request')).toBe(false)
-})
-
-test('审批：中转出错时交回本地，不卡住', async ($, on) => {
-  fakeRelay(on, {
-    '/mod/poll': () => ({ ok: true, messages: [] }),
-    '/mod/approval/request': () => ({ status: 500, ok: false, error: 'boom' }),
-  })
-  on('tool.check', () => ({ decision: 'ask' as const }))
-  const { clock, statuses } = engineBeneath(on)
-  await startSession($)
-  await clock.advance(2000)
-  await inImTurn($)
-
-  const verdict = await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: 'tu1' })
-  expect(verdict.decision).toBe('ask')
-  expect(statuses.at(-1)).toContain('审批转发失败：boom')
-})
-
-test('审批：auto、bypassPermissions、dontAsk 和未知模式下不转（交给分类器或本地原样）', async ($, on) => {
-  const { calls } = approvalRelay(on, ['approved'])
-  on('tool.check', () => ({ decision: 'ask' as const }))
-  const { clock } = engineBeneath(on)
-  await startSession($)
-  await clock.advance(2000)
-
-  await $.turn.start({ text: '[来自 IM 的消息，本轮最终回复会自动发回 IM，请简洁]\n未知模式', turnId: 'im0' })
-  expect((await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: 'tu0' })).decision).toBe('ask')
-
-  for (const mode of ['auto', 'bypassPermissions', 'dontAsk']) {
-    await inImTurn($, mode)
-    const verdict = await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: `tu-${mode}` })
-    expect(verdict.decision).toBe('ask')
-  }
-  expect(calls.some(c => c.path === '/mod/approval/request')).toBe(false)
-
-  await inImTurn($, 'acceptEdits')
-  expect((await $.tool.check({ tool: 'Bash', input: { command: 'ls' }, tool_use_id: 'tu-ae' })).decision).toBe('allow')
+  await $.tool.call({ tool: 'mcp__cc-im-bridge__send', text: 'x' })
+  await clock.settle()
+  const settles = calls.filter(c => c.path === '/mod/approval/settle-local')
+  expect(settles.length).toBe(1)
 })
