@@ -196,10 +196,16 @@ try {
       initialChatId,
       WebSocketImpl: MiniWebSocket,
       onText: text => relay.handleIncoming(text),
+      onCardAction: ({ id, approve }) => {
+        const r = relay.decideApproval({ id, approve })
+        return r.approval ?? null
+      },
       onChatId: chatId => writeFileSync(WECOM_STATE, JSON.stringify({ chatId }) + '\n', { mode: 0o600 }),
     })
     relay.onOutgoing(entry =>
-      wecom.send(formatOutgoing(entry)).catch(err => console.error(`发往企微失败：${err.message}`)),
+      (entry.approval ? wecom.sendApprovalCard(entry.approval, formatOutgoing(entry)) : wecom.send(formatOutgoing(entry))).catch(
+        err => console.error(`发往企微失败：${err.message}`),
+      ),
     )
     wecom.start()
     console.log(`企微：白名单 ${config.allowUsers.length} 人，正在连接`)

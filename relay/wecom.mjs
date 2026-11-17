@@ -12,6 +12,37 @@ const MAX_AUTH_FAILURES = 5
 // 官方未写明 aibot_send_msg 的长度上限（被动回复是 20480 字节），按 cc-connect 的做法保守地切成 2000 字节一段。
 export const CHUNK_BYTES = 2000
 const DEDUP_SIZE = 500
+const CARD_SUMMARY_CHARS = 300
+const CARD_KEY = /^appr:(\d+):(y|n)$/
+
+// 审批卡片：标题写会话名，按钮 key 带审批编号。task_id 每台机器人内不能重复，
+// 中转重启后审批编号从 1 重新计，所以前面加一段启动时的随机串。
+export function approvalCard({ id, name, tool, summary }, taskPrefix, state = 'pending') {
+  const text = summary.length > CARD_SUMMARY_CHARS ? `${summary.slice(0, CARD_SUMMARY_CHARS)}…` : summary
+  const status = { pending: '', approved: '已批准', denied: '已拒绝', cancelled: '已作废', expired: '已超时' }[state] ?? state
+  const card = {
+    card_type: 'button_interaction',
+    source: { desc: 'cc-im-bridge' },
+    main_title: { title: `${name} 请求批准`, desc: `#${id} · ${tool}${status ? ` · ${status}` : ''}` },
+    sub_title_text: text || ' ',
+    card_action: { type: 0 },
+    task_id: `${taskPrefix}_${id}`,
+  }
+  card.button_list =
+    state === 'pending'
+      ? [
+          { text: '批准', style: 1, key: `appr:${id}:y` },
+          { text: '拒绝', style: 3, key: `appr:${id}:n` },
+        ]
+      : // 结果定了只留一个灰色按钮显示结论；再点会被忽略。
+        [{ text: status, style: 2, key: `appr:${id}:done` }]
+  return card
+}
+
+export function parseCardKey(key) {
+  const m = CARD_KEY.exec(key ?? '')
+  return m ? { id: Number(m[1]), approve: m[2] === 'y' } : null
+}
 
 export function splitByBytes(text, maxBytes = CHUNK_BYTES) {
   const encoder = new TextEncoder()
@@ -53,6 +84,8 @@ export function createWecomAdapter({
   secret,
   allowUsers = [],
   onText,
+  // 用户点了审批卡片的按钮：({ id, approve }) => 当前审批对象（含 status），用于把卡片更新成结论。
+  onCardAction = () => null,
   onChatId = () => {},
   initialChatId = '',
   log = console,
@@ -75,6 +108,8 @@ export function createWecomAdapter({
   let isAuthenticated = false
   let chatId = initialChatId
   let sendChain = Promise.resolve()
+  const taskPrefix = `ccim_${Math.random().toString(36).slice(2, 10)}`
+  const cards = new Map() // 审批编号 -> 发出时的卡片内容，用于点按钮后更新
 
   const reqId = prefix => `${prefix}_${Date.now()}_${++seq}`
   const write = frame => ws.send(JSON.stringify(frame))
@@ -131,9 +166,39 @@ export function createWecomAdapter({
     if (text) onText(text, { userId, chatId: replyTo })
   }
 
+  // 点审批卡片的按钮。要在 5 秒内用事件的 req_id 回 update_template_card，卡片才会变成结论。
+  function handleCardEvent(frame) {
+    const body = frame.body ?? {}
+    if (body.msgid) {
+      if (seen.includes(body.msgid)) return
+      seen.push(body.msgid)
+      if (seen.length > DEDUP_SIZE) seen.shift()
+    }
+    const userId = body.from?.userid ?? ''
+    if (!allowed.has(userId)) {
+      log.warn(`企微：忽略白名单外用户 ${userId} 的卡片点击`)
+      return
+    }
+    const action = parseCardKey(body.event?.event_key)
+    if (!action) return
+    const approval = onCardAction(action)
+    const sent = approval && cards.get(action.id)
+    if (!sent) return
+    const card = approvalCard(sent, taskPrefix, approval.status)
+    writeAndWait('aibot_respond_update_msg', frame.headers?.req_id, {
+      response_type: 'update_template_card',
+      template_card: card,
+    }).catch(err => {
+      log.warn(`企微：更新审批卡片 #${action.id} 失败：${err.message}`)
+      // 卡片没能变样时，用一条文字告诉结论，免得用户以为没点上。
+      send(card.main_title.desc).catch(e => log.warn(`企微：补发审批结论失败：${e.message}`))
+    })
+  }
+
   function handleFrame(frame) {
     if (frame.cmd === 'aibot_msg_callback') return handleCallback(frame)
     if (frame.cmd === 'aibot_event_callback') {
+      if (frame.body?.event?.eventtype === 'template_card_event') return handleCardEvent(frame)
       if (frame.body?.event?.eventtype === 'disconnected_event') {
         // 同一机器人建立了新连接，服务端会断开本连接；重连只会互相踢，所以停下等人处理。
         log.error('企微：同一机器人在别处建立了新连接，本中转已断开且不再重连。确认只有一个中转在用这个机器人后重启中转。')
@@ -216,21 +281,42 @@ export function createWecomAdapter({
     })
   }
 
-  function sendChunk(target, content) {
+  // 发一帧并等回执。主动发消息用新 req_id；回应事件（更新卡片）要沿用事件的 req_id。
+  function writeAndWait(cmd, id, body) {
     return new Promise((resolve, reject) => {
       if (!ws || !isAuthenticated) return reject(new Error('企微未连接，消息未发出'))
-      const id = reqId('aibot_send_msg')
+      if (!id) return reject(new Error(`${cmd} 缺 req_id`))
       const timer = timers.setTimeout(() => {
         pendingAcks.delete(id)
-        reject(new Error(`企微发送 ${ACK_TIMEOUT_MS / 1000} 秒内无回执（req_id=${id}）`))
+        reject(new Error(`企微 ${cmd} ${ACK_TIMEOUT_MS / 1000} 秒内无回执（req_id=${id}）`))
       }, ACK_TIMEOUT_MS)
       pendingAcks.set(id, { resolve, reject, timer })
-      write({
-        cmd: 'aibot_send_msg',
-        headers: { req_id: id },
-        body: { chatid: target, msgtype: 'markdown', markdown: { content } },
-      })
+      write({ cmd, headers: { req_id: id }, body })
     })
+  }
+
+  const sendChunk = (target, content) =>
+    writeAndWait('aibot_send_msg', reqId('aibot_send_msg'), { chatid: target, msgtype: 'markdown', markdown: { content } })
+
+  // 审批请求发成带「批准」「拒绝」按钮的卡片；卡片发不出去时退回文字。
+  function sendApprovalCard(approval, fallbackText) {
+    const run = sendChain.then(async () => {
+      if (!chatId) throw new Error('还不知道发给谁：先在企微里给机器人发一条消息')
+      cards.set(approval.id, approval)
+      if (cards.size > DEDUP_SIZE) cards.delete(cards.keys().next().value)
+      try {
+        await writeAndWait('aibot_send_msg', reqId('aibot_send_msg'), {
+          chatid: chatId,
+          msgtype: 'template_card',
+          template_card: approvalCard(approval, taskPrefix),
+        })
+      } catch (err) {
+        log.warn(`企微：审批卡片 #${approval.id} 发送失败，改发文字：${err.message}`)
+        for (const chunk of splitByBytes(fallbackText)) await sendChunk(chatId, chunk)
+      }
+    })
+    sendChain = run.catch(() => {})
+    return run
   }
 
   // 按顺序逐段发送并等回执；某段失败就放弃本条剩余部分。
@@ -257,6 +343,7 @@ export function createWecomAdapter({
     start: connect,
     stop,
     send,
+    sendApprovalCard,
     get isConnected() {
       return isAuthenticated
     },

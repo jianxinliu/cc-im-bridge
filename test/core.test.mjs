@@ -147,7 +147,7 @@ test('审批：请求发到 IM，/y 编号 批准、/n 编号 原因 拒绝', ()
   const { relay, lastReply } = setup()
   relay.register({ sessionId: 's1', name: 'api', cwd: '' })
   const { id } = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'npm publish' })
-  assert.match(lastReply(), new RegExp(`请求批准 #${id}：Bash\\nnpm publish\\n回复 /y ${id}`))
+  assert.match(lastReply(), new RegExp(`请求批准 #${id}：Bash\\nnpm publish\\n回复「好」批准`))
   relay.handleIncoming(`/y ${id}`)
   assert.deepEqual(relay.getApproval({ id }).approval, { id, state: 'approved', reason: '' })
   assert.match(lastReply(), /已批准/)
@@ -163,7 +163,7 @@ test('审批：只有一条待批时 /y 可省略编号；多条时要求带编�
   const a = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'a' })
   const b = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'b' })
   relay.handleIncoming('/y')
-  assert.match(lastReply(), new RegExp(`有 2 条待批，请带编号：#${a.id} #${b.id}`))
+  assert.match(lastReply(), new RegExp(`有 2 条待批，请点卡片上的按钮，或带编号：#${a.id} #${b.id}`))
   relay.handleIncoming(`/n ${a.id}`)
   relay.handleIncoming('/y')
   assert.equal(relay.getApproval({ id: b.id }).approval.state, 'approved')
@@ -237,4 +237,55 @@ test('在电脑上处理后作废审批：按工具与摘要只作废对得上�
   assert.equal(relay.settleLocal({ sessionId: 's1' }).cancelled, 0, '已答复的不动')
   assert.equal(relay.getApproval({ id: b.id }).approval.state, 'approved')
   assert.equal(relay.getApproval({ id: c.id }).approval.state, 'pending', '别的会话不动')
+})
+
+test('审批请求带结构化字段，供 IM 画卡片', () => {
+  const { relay } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  const { id } = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'npm publish' })
+  assert.deepEqual(relay.since(0).at(-1).approval, { id, name: 'api', tool: 'Bash', summary: 'npm publish' })
+})
+
+test('口语答复：只有一条待批时「好」「可以！」批准，「不行，原因」拒绝并带原因', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  for (const [say, state, reason] of [['好', 'approved', ''], ['可以！', 'approved', ''], ['OK', 'approved', ''], ['不行，先别发版', 'denied', '先别发版'], ['先别', 'denied', '']]) {
+    const { id } = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'x' })
+    relay.handleIncoming(say)
+    assert.deepEqual(relay.getApproval({ id }).approval, { id, state, reason }, say)
+    assert.match(lastReply(), new RegExp(`#${id} ${state === 'approved' ? '已批准' : '已拒绝'}`))
+  }
+})
+
+test('口语答复：没有待批或有多条待批时，「好」当普通消息；多条时提示点按钮', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.handleIncoming('好')
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['好'])
+
+  const a = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'a' })
+  relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'b' })
+  relay.handleIncoming('好')
+  assert.equal(relay.getApproval({ id: a.id }).approval.state, 'pending')
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['好'], '多条待批时不猜，照常发给会话')
+  relay.handleIncoming('/y')
+  assert.match(lastReply(), /请点卡片上的按钮/)
+})
+
+test('口语答复：不是整句匹配就不算（「好像有问题」不会被当成批准）', () => {
+  const { relay } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  const { id } = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'x' })
+  for (const say of ['好像有问题', '可以吗', '行不行', 'okay?']) relay.handleIncoming(say)
+  assert.equal(relay.getApproval({ id }).approval.state, 'pending')
+})
+
+test('decideApproval：已有结果的不改，返回当前结果', () => {
+  const { relay } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  const { id } = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'x' })
+  assert.equal(relay.decideApproval({ id, approve: true }).state, 'approved')
+  const again = relay.decideApproval({ id, approve: false })
+  assert.deepEqual([again.ok, again.status, again.state], [false, 409, 'approved'])
+  assert.equal(relay.decideApproval({ id: 99, approve: true }).status, 404)
 })

@@ -5,7 +5,11 @@ export const APPROVAL_TTL_MS = 15 * 60_000
 const MAX_QUEUE = 50
 const MAX_LOG = 500
 
-const STATUS_TEXT = { pending: '待批', approved: '已批准', denied: '已拒绝', cancelled: '已作废', expired: '已超时' }
+export const STATUS_TEXT = { pending: '待批', approved: '已批准', denied: '已拒绝', cancelled: '已作废', expired: '已超时' }
+// 只有一条待批时，单独回这些词当作批准或拒绝（去掉标点后整句精确匹配，避免把闲聊当成批准）。
+// 批准词只收明确的肯定；拒绝方向放宽一些，误判也只是不执行。
+const APPROVE_WORDS = new Set(['好', '好的', '好啊', '可以', '行', '批准', '同意', '确认', 'ok'])
+const DENY_WORDS = ['不行', '不可以', '不要', '不用', '拒绝', '不同意', '先别', '别', '不', 'no', 'n']
 
 export function createRelay({ now = () => Date.now() } = {}) {
   const sessions = new Map() // sessionId -> { sessionId, name, cwd, lastSeen, queue: [] }
@@ -159,13 +163,15 @@ export function createRelay({ now = () => Date.now() } = {}) {
     const decision = text.match(/^\/(y|n)(?:\s+([\s\S]*))?$/)
     if (decision) return decideFromIm(decision[1] === 'y', decision[2] ?? '')
 
+    if (naturalDecision(text)) return
+
     if (text === '/pending') {
       const pending = pendingApprovals()
       return tell(pending.length === 0 ? '没有待批的请求' : pending.map(a => `#${a.id} ${a.name}：${a.tool} ${a.summary.split('\n')[0]}`).join('\n'))
     }
 
     if (text === '/help') {
-      return tell('/list 列出会话；/use 编号或名字 切换默认会话；@编号 内容 或 @名字前缀 内容 发给指定会话；其余内容发给上次的会话；/y 编号 批准，/n 编号 原因 拒绝，/pending 查看待批')
+      return tell('/list 列出会话；/use 编号或名字 切换默认会话；@编号 内容 或 @名字前缀 内容 发给指定会话；其余内容发给上次的会话。审批：点卡片按钮，或回「好」「不行，原因」；/pending 查看待批')
     }
 
     const at = text.match(/^@(\S+)\s+([\s\S]+)$/)
@@ -211,7 +217,9 @@ export function createRelay({ now = () => Date.now() } = {}) {
     pushLog({
       dir: 'out',
       from: s.name,
-      text: `请求批准 #${a.id}：${tool}\n${a.summary}\n回复 /y ${a.id} 批准，/n ${a.id} 原因 拒绝`.replace(/\n\n/g, '\n'),
+      text: `请求批准 #${a.id}：${tool}\n${a.summary}\n回复「好」批准，「不行」拒绝`.replace(/\n\n/g, '\n'),
+      // IM 适配器据此画成带按钮的卡片；网页窗口仍显示 text。
+      approval: { id: a.id, name: s.name, tool, summary: a.summary },
     })
     return { ok: true, id: a.id }
   }
@@ -268,23 +276,57 @@ export function createRelay({ now = () => Date.now() } = {}) {
     return [...approvals.values()].filter(a => a.status === 'pending')
   }
 
-  // IM 里的 /y [编号]、/n [编号] [原因]；只有一条待批时可省略编号。
+  // 按编号批准或拒绝。已经有结果的不再改，返回当前结果，供卡片按钮显示最终状态。
+  function decideApproval({ id, approve, reason = '' }) {
+    expireOld()
+    const a = approvals.get(Number(id))
+    if (!a) return { ok: false, status: 404, error: `没有审批 #${id}` }
+    if (a.status !== 'pending') {
+      return { ok: false, status: 409, state: a.status, approval: a, error: `审批 #${a.id} 已是「${STATUS_TEXT[a.status]}」，不能再改` }
+    }
+    settle(a, approve ? 'approved' : 'denied', reason)
+    return { ok: true, state: a.status, approval: a }
+  }
+
+  const decidedText = a => `#${a.id} ${STATUS_TEXT[a.status]}（${a.name}：${a.tool}）`
+
+  // IM 里的 /y [编号]、/n [编号] [原因]，或「好」「不行，原因」；只有一条待批时可省略编号。
   function decideFromIm(isApprove, rest) {
     const m = rest.match(/^(\d+)?\s*([\s\S]*)$/)
     const pending = pendingApprovals()
-    let a
+    let id
     if (m[1]) {
-      a = approvals.get(Number(m[1]))
-      if (!a) return tell(`没有审批 #${m[1]}`)
-      if (a.status !== 'pending') return tell(`审批 #${a.id} 已是「${STATUS_TEXT[a.status]}」，不能再改`)
+      id = Number(m[1])
     } else if (pending.length === 1) {
-      a = pending[0]
+      id = pending[0].id
     } else {
-      return tell(pending.length === 0 ? '没有待批的请求' : `有 ${pending.length} 条待批，请带编号：${pending.map(p => `#${p.id}`).join(' ')}`)
+      return tell(pending.length === 0 ? '没有待批的请求' : `有 ${pending.length} 条待批，请点卡片上的按钮，或带编号：${pending.map(p => `#${p.id}`).join(' ')}`)
     }
-    const reason = (m[2] ?? '').trim()
-    settle(a, isApprove ? 'approved' : 'denied', reason)
-    tell(`#${a.id} ${isApprove ? '已批准' : '已拒绝'}（${a.name}：${a.tool}）`)
+    const r = decideApproval({ id, approve: isApprove, reason: (m[2] ?? '').trim() })
+    tell(r.ok ? decidedText(r.approval) : r.error)
+  }
+
+  // 「好」「不行」「不行，先别发」这类口语答复。只在恰好一条待批时生效，否则返回 false 交给后续处理。
+  function naturalDecision(text) {
+    if (pendingApprovals().length !== 1) return false
+    const trimmed = text.replace(/[。！!.~～\s]+$/u, '')
+    const bare = trimmed.toLowerCase()
+    if (APPROVE_WORDS.has(bare)) {
+      decideFromIm(true, '')
+      return true
+    }
+    for (const word of DENY_WORDS) {
+      if (bare === word) {
+        decideFromIm(false, '')
+        return true
+      }
+      const withReason = trimmed.match(new RegExp(`^${word}[，,：:\\s]+([\\s\\S]+)$`, 'iu'))
+      if (withReason) {
+        decideFromIm(false, withReason[1].trim())
+        return true
+      }
+    }
+    return false
   }
 
   const onApprovalChange = listener => approvalListeners.push(listener)
@@ -302,6 +344,8 @@ export function createRelay({ now = () => Date.now() } = {}) {
     getApproval,
     cancelApproval,
     onApprovalChange,
+    decideApproval,
+    tell,
     setForward,
     hookPermission,
     settleLocal,

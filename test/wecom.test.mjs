@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { createWecomAdapter, extractText, formatOutgoing, loadWecomConfig, splitByBytes } from '../relay/wecom.mjs'
+import { approvalCard, createWecomAdapter, extractText, formatOutgoing, loadWecomConfig, parseCardKey, splitByBytes } from '../relay/wecom.mjs'
 
 // 假 WebSocket：记录发出的帧，测试用 serverSays 模拟服务端下发。
 function fakeSocketFactory() {
@@ -297,4 +297,123 @@ test('loadWecomConfig：缺文件返回 null；权限过宽、字段缺失时报
     secret: 's',
     allowUsers: ['u1'],
   })
+})
+
+const ackLast = s => s.serverSays({ headers: { req_id: s.lastSent().headers.req_id }, errcode: 0 })
+const tick = () => new Promise(r => setImmediate(r))
+const approval = { id: 3, name: 'api', tool: 'Bash', summary: 'npm publish' }
+const cardEvent = (from, key, extra = {}) => ({
+  cmd: 'aibot_event_callback',
+  headers: { req_id: `evt_${Math.random()}` },
+  body: { msgid: `e_${Math.random()}`, from: { userid: from }, msgtype: 'event', event: { eventtype: 'template_card_event', event_key: key, task_id: 't' }, ...extra },
+})
+
+test('审批卡片：带批准/拒绝按钮，标题写会话名与编号', () => {
+  const card = approvalCard(approval, 'ccim_x')
+  assert.equal(card.card_type, 'button_interaction')
+  assert.deepEqual(card.main_title, { title: 'api 请求批准', desc: '#3 · Bash' })
+  assert.equal(card.sub_title_text, 'npm publish')
+  assert.deepEqual(card.button_list.map(b => [b.text, b.key]), [['批准', 'appr:3:y'], ['拒绝', 'appr:3:n']])
+  assert.equal(card.task_id, 'ccim_x_3')
+  assert.match(card.task_id, /^[\w\-@]{1,128}$/)
+
+  const done = approvalCard(approval, 'ccim_x', 'denied')
+  assert.equal(done.main_title.desc, '#3 · Bash · 已拒绝')
+  assert.deepEqual(done.button_list.map(b => [b.text, b.key]), [['已拒绝', 'appr:3:done']])
+  assert.equal(done.task_id, card.task_id, '更新时 task_id 不变')
+
+  assert.equal(approvalCard({ ...approval, summary: 'x'.repeat(500) }, 'p').sub_title_text.length, 301)
+})
+
+test('parseCardKey 只认审批按钮', () => {
+  assert.deepEqual(parseCardKey('appr:12:y'), { id: 12, approve: true })
+  assert.deepEqual(parseCardKey('appr:12:n'), { id: 12, approve: false })
+  for (const k of ['appr:12:done', 'appr:x:y', 'other', undefined]) assert.equal(parseCardKey(k), null)
+})
+
+test('发审批卡片：按 chatid 发 template_card', async () => {
+  const { socket, authOk, adapter } = setup()
+  authOk()
+  socket().serverSays(textFrame('alice', 'hi'))
+  const done = adapter.sendApprovalCard(approval, '文字备用')
+  await tick()
+  const frame = socket().lastSent()
+  assert.equal(frame.cmd, 'aibot_send_msg')
+  assert.equal(frame.body.chatid, 'alice')
+  assert.equal(frame.body.msgtype, 'template_card')
+  assert.equal(frame.body.template_card.button_list[0].key, 'appr:3:y')
+  ackLast(socket())
+  await done
+})
+
+test('卡片发不出去时退回文字', async () => {
+  const { socket, authOk, adapter } = setup()
+  authOk()
+  socket().serverSays(textFrame('alice', 'hi'))
+  const done = adapter.sendApprovalCard(approval, '请求批准 #3 文字版')
+  await tick()
+  socket().serverSays({ headers: { req_id: socket().lastSent().headers.req_id }, errcode: 40058, errmsg: 'bad card' })
+  await tick()
+  const fallback = socket().lastSent()
+  assert.equal(fallback.body.msgtype, 'markdown')
+  assert.equal(fallback.body.markdown.content, '请求批准 #3 文字版')
+  ackLast(socket())
+  await done
+})
+
+test('点批准按钮：交给中转决定，并用事件的 req_id 把卡片更新成结论', async () => {
+  const actions = []
+  const { socket, authOk, adapter } = setup({
+    onCardAction: a => {
+      actions.push(a)
+      return { ...approval, status: a.approve ? 'approved' : 'denied' }
+    },
+  })
+  authOk()
+  socket().serverSays(textFrame('alice', 'hi'))
+  const sending = adapter.sendApprovalCard(approval, 'x')
+  await tick()
+  ackLast(socket())
+  await sending
+
+  const evt = cardEvent('alice', 'appr:3:y')
+  socket().serverSays(evt)
+  assert.deepEqual(actions, [{ id: 3, approve: true }])
+  const update = socket().lastSent()
+  assert.equal(update.cmd, 'aibot_respond_update_msg')
+  assert.equal(update.headers.req_id, evt.headers.req_id)
+  assert.equal(update.body.response_type, 'update_template_card')
+  assert.equal(update.body.template_card.main_title.desc, '#3 · Bash · 已批准')
+  assert.equal(update.body.template_card.task_id.endsWith('_3'), true)
+
+  socket().serverSays(evt)
+  assert.equal(actions.length, 1, '同一事件重复推送只处理一次')
+})
+
+test('卡片点击：白名单外用户、非审批按钮、「已批准」灰按钮都忽略', async () => {
+  const actions = []
+  const { socket, authOk } = setup({ onCardAction: a => (actions.push(a), null) })
+  authOk()
+  const before = socket().sent.length
+  socket().serverSays(cardEvent('mallory', 'appr:3:y'))
+  socket().serverSays(cardEvent('alice', 'appr:3:done'))
+  socket().serverSays(cardEvent('alice', 'something'))
+  assert.equal(actions.length, 0)
+  assert.equal(socket().sent.length, before)
+})
+
+test('卡片更新失败时补发一条文字结论', async () => {
+  const { socket, authOk, adapter } = setup({ onCardAction: () => ({ ...approval, status: 'approved' }) })
+  authOk()
+  socket().serverSays(textFrame('alice', 'hi'))
+  const sending = adapter.sendApprovalCard(approval, 'x')
+  await tick()
+  ackLast(socket())
+  await sending
+  const evt = cardEvent('alice', 'appr:3:y')
+  socket().serverSays(evt)
+  socket().serverSays({ headers: { req_id: evt.headers.req_id }, errcode: 60020, errmsg: 'expired' })
+  await tick()
+  await tick()
+  assert.equal(socket().lastSent().body.markdown.content, '#3 · Bash · 已批准')
 })
