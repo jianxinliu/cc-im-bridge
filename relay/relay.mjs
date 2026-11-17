@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// 本地中转：Unix socket 给各会话的 mod 用；127.0.0.1 上的网页聊天窗口充当 IM 端。
+// 本地中转：Unix socket 给各会话的 mod 用；IM 端是企业微信（配置了 wecom.json 时）和 127.0.0.1 上的网页聊天窗口。
 import { randomBytes } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
 import { homedir } from 'node:os'
@@ -9,6 +9,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { createRelay } from './core.mjs'
+import { createWecomAdapter, formatOutgoing, loadWecomConfig } from './wecom.mjs'
 
 const HOME = process.env.CC_IM_HOME ?? join(homedir(), '.cc-im-bridge')
 const SOCKET = join(HOME, 'relay.sock')
@@ -142,7 +143,41 @@ webServer.on('error', err => {
   process.exit(1)
 })
 
+// ---- 企业微信 ----
+const WECOM_CONFIG = join(HOME, 'wecom.json')
+const WECOM_STATE = join(HOME, 'wecom-state.json')
+let wecom = null
+try {
+  const config = loadWecomConfig(WECOM_CONFIG, { readFile: readFileSync, stat: statSync })
+  if (!config) {
+    console.log(`未找到 ${WECOM_CONFIG}，只启用网页聊天窗口`)
+  } else {
+    // 记住最近对话的 chatid，重启后会话主动发消息也知道发给谁。
+    let initialChatId = ''
+    try {
+      initialChatId = JSON.parse(readFileSync(WECOM_STATE, 'utf8')).chatId ?? ''
+    } catch (err) {
+      if (err.code !== 'ENOENT') console.warn(`读取 ${WECOM_STATE} 失败，忽略：${err.message}`)
+    }
+    wecom = createWecomAdapter({
+      ...config,
+      initialChatId,
+      onText: text => relay.handleIncoming(text),
+      onChatId: chatId => writeFileSync(WECOM_STATE, JSON.stringify({ chatId }) + '\n', { mode: 0o600 }),
+    })
+    relay.onOutgoing(entry =>
+      wecom.send(formatOutgoing(entry)).catch(err => console.error(`发往企微失败：${err.message}`)),
+    )
+    wecom.start()
+    console.log(`企微：白名单 ${config.allowUsers.length} 人，正在连接`)
+  }
+} catch (err) {
+  console.error(`企微未启用：${err.message}`)
+  process.exit(1)
+}
+
 const shutdown = () => {
+  wecom?.stop()
   modServer.close()
   webServer.close()
   try {

@@ -1,0 +1,298 @@
+// 企业微信智能机器人长连接适配器。
+// 协议依据：官方 SDK @wecom/aibot-node-sdk 1.0.7 的实现（帧格式、心跳 30 秒、回执超时 5 秒、
+// 新连接建立后服务端向旧连接发 disconnected_event 并断开）。用 Node 自带的 WebSocket，不引第三方依赖。
+
+export const WECOM_WS_URL = 'wss://openws.work.weixin.qq.com'
+const HEARTBEAT_MS = 30_000
+const MAX_MISSED_PONGS = 2
+const ACK_TIMEOUT_MS = 5_000
+const RECONNECT_BASE_MS = 1_000
+const RECONNECT_MAX_MS = 30_000
+const MAX_AUTH_FAILURES = 5
+// 官方未写明 aibot_send_msg 的长度上限（被动回复是 20480 字节），按 cc-connect 的做法保守地切成 2000 字节一段。
+export const CHUNK_BYTES = 2000
+const DEDUP_SIZE = 500
+
+export function splitByBytes(text, maxBytes = CHUNK_BYTES) {
+  const encoder = new TextEncoder()
+  const chunks = []
+  let current = ''
+  let size = 0
+  for (const ch of text) {
+    const n = encoder.encode(ch).length
+    if (size + n > maxBytes && current) {
+      chunks.push(current)
+      current = ''
+      size = 0
+    }
+    current += ch
+    size += n
+  }
+  if (current) chunks.push(current)
+  return chunks
+}
+
+// 从 aibot_msg_callback 的 body 里取出文字；群聊里去掉开头 @机器人 的部分。
+// 只返回文字，图片、文件等返回 null。
+export function extractText(body) {
+  let text = null
+  if (body?.msgtype === 'text') text = body.text?.content ?? ''
+  else if (body?.msgtype === 'voice') text = body.voice?.content || body.voice?.text || ''
+  else if (body?.msgtype === 'mixed') {
+    const parts = (body.mixed?.msg_item ?? []).filter(i => i.msgtype === 'text').map(i => i.text?.content ?? '')
+    text = parts.length ? parts.join('\n') : null
+  }
+  if (text === null) return null
+  text = text.trim()
+  if (body.chattype === 'group') text = text.replace(/^@\S+\s*/, '')
+  return text
+}
+
+export function createWecomAdapter({
+  botId,
+  secret,
+  allowUsers = [],
+  onText,
+  onChatId = () => {},
+  initialChatId = '',
+  log = console,
+  url = WECOM_WS_URL,
+  WebSocketImpl = globalThis.WebSocket,
+  timers = { setTimeout, clearTimeout, setInterval, clearInterval },
+}) {
+  if (!botId || !secret) throw new Error('企微配置缺少 botId 或 secret')
+  const allowed = new Set(allowUsers)
+  const seen = []
+  const pendingAcks = new Map() // req_id -> { resolve, reject, timer }
+  let ws = null
+  let seq = 0
+  let heartbeat = null
+  let missedPongs = 0
+  let reconnectTimer = null
+  let reconnectAttempts = 0
+  let authFailures = 0
+  let isStopped = false
+  let isAuthenticated = false
+  let chatId = initialChatId
+  let sendChain = Promise.resolve()
+
+  const reqId = prefix => `${prefix}_${Date.now()}_${++seq}`
+  const write = frame => ws.send(JSON.stringify(frame))
+
+  function stopHeartbeat() {
+    if (heartbeat) timers.clearInterval(heartbeat)
+    heartbeat = null
+  }
+
+  function failPending(reason) {
+    for (const [id, p] of pendingAcks) {
+      timers.clearTimeout(p.timer)
+      p.reject(new Error(`${reason}（req_id=${id}）`))
+    }
+    pendingAcks.clear()
+  }
+
+  function scheduleReconnect() {
+    if (isStopped || reconnectTimer) return
+    const delay = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttempts, RECONNECT_MAX_MS)
+    reconnectAttempts++
+    log.warn(`企微：${delay / 1000} 秒后重连（第 ${reconnectAttempts} 次）`)
+    reconnectTimer = timers.setTimeout(() => {
+      reconnectTimer = null
+      connect()
+    }, delay)
+  }
+
+  function handleCallback(frame) {
+    const body = frame.body ?? {}
+    if (body.msgid) {
+      if (seen.includes(body.msgid)) return
+      seen.push(body.msgid)
+      if (seen.length > DEDUP_SIZE) seen.shift()
+    }
+    const userId = body.from?.userid ?? ''
+    const replyTo = body.chatid || userId
+    if (!allowed.has(userId)) {
+      log.warn(`企微：拒绝白名单外用户 ${userId} 的消息`)
+      sendTo(replyTo, `你的 userid 是 ${userId}，不在白名单里。管理员把它加进 ~/.cc-im-bridge/wecom.json 的 allowUsers 并重启中转后才能使用。`).catch(
+        err => log.error(`企微：回复白名单外用户失败：${err.message}`),
+      )
+      return
+    }
+    const text = extractText(body)
+    if (replyTo && replyTo !== chatId) {
+      chatId = replyTo
+      onChatId(chatId)
+    }
+    if (text === null) {
+      send(`暂只支持文字消息，收到的是 ${body.msgtype}`).catch(err => log.error(`企微：${err.message}`))
+      return
+    }
+    if (text) onText(text, { userId, chatId: replyTo })
+  }
+
+  function handleFrame(frame) {
+    if (frame.cmd === 'aibot_msg_callback') return handleCallback(frame)
+    if (frame.cmd === 'aibot_event_callback') {
+      if (frame.body?.event?.eventtype === 'disconnected_event') {
+        // 同一机器人建立了新连接，服务端会断开本连接；重连只会互相踢，所以停下等人处理。
+        log.error('企微：同一机器人在别处建立了新连接，本中转已断开且不再重连。确认只有一个中转在用这个机器人后重启中转。')
+        isStopped = true
+        stopHeartbeat()
+        failPending('企微连接被新连接取代')
+        ws?.close()
+      }
+      return
+    }
+    const id = frame.headers?.req_id ?? ''
+    if (id.startsWith('aibot_subscribe')) {
+      if (frame.errcode !== 0) {
+        authFailures++
+        log.error(`企微：认证失败 errcode=${frame.errcode} errmsg=${frame.errmsg}（第 ${authFailures} 次）`)
+        if (authFailures >= MAX_AUTH_FAILURES) {
+          log.error(`企微：连续 ${MAX_AUTH_FAILURES} 次认证失败，停止重连。检查 wecom.json 里的 botId 和 secret。`)
+          isStopped = true
+        }
+        ws?.close()
+        return
+      }
+      isAuthenticated = true
+      authFailures = 0
+      reconnectAttempts = 0
+      missedPongs = 0
+      log.log('企微：已连接')
+      stopHeartbeat()
+      heartbeat = timers.setInterval(() => {
+        if (missedPongs >= MAX_MISSED_PONGS) {
+          log.warn(`企微：连续 ${missedPongs} 次心跳无回应，断开重连`)
+          ws?.close()
+          return
+        }
+        missedPongs++
+        write({ cmd: 'ping', headers: { req_id: reqId('ping') } })
+      }, HEARTBEAT_MS)
+      return
+    }
+    if (id.startsWith('ping')) {
+      missedPongs = 0
+      return
+    }
+    const pending = pendingAcks.get(id)
+    if (pending) {
+      pendingAcks.delete(id)
+      timers.clearTimeout(pending.timer)
+      if (frame.errcode && frame.errcode !== 0) {
+        pending.reject(new Error(`企微拒绝发送 errcode=${frame.errcode} errmsg=${frame.errmsg}`))
+      } else pending.resolve()
+    }
+  }
+
+  function connect() {
+    if (isStopped) return
+    isAuthenticated = false
+    const socket = new WebSocketImpl(url)
+    ws = socket
+    socket.addEventListener('open', () => {
+      write({ cmd: 'aibot_subscribe', headers: { req_id: reqId('aibot_subscribe') }, body: { bot_id: botId, secret } })
+    })
+    socket.addEventListener('message', ev => {
+      let frame
+      try {
+        frame = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data))
+      } catch (err) {
+        log.warn(`企微：收到无法解析的帧：${err.message}`)
+        return
+      }
+      handleFrame(frame)
+    })
+    socket.addEventListener('error', ev => log.warn(`企微：连接出错：${ev.message ?? ev.type}`))
+    socket.addEventListener('close', () => {
+      if (ws !== socket) return
+      ws = null
+      isAuthenticated = false
+      stopHeartbeat()
+      failPending('企微连接已断开')
+      scheduleReconnect()
+    })
+  }
+
+  function sendChunk(target, content) {
+    return new Promise((resolve, reject) => {
+      if (!ws || !isAuthenticated) return reject(new Error('企微未连接，消息未发出'))
+      const id = reqId('aibot_send_msg')
+      const timer = timers.setTimeout(() => {
+        pendingAcks.delete(id)
+        reject(new Error(`企微发送 ${ACK_TIMEOUT_MS / 1000} 秒内无回执（req_id=${id}）`))
+      }, ACK_TIMEOUT_MS)
+      pendingAcks.set(id, { resolve, reject, timer })
+      write({
+        cmd: 'aibot_send_msg',
+        headers: { req_id: id },
+        body: { chatid: target, msgtype: 'markdown', markdown: { content } },
+      })
+    })
+  }
+
+  // 按顺序逐段发送并等回执；某段失败就放弃本条剩余部分。
+  function sendTo(target, text) {
+    const run = sendChain.then(async () => {
+      if (!target) throw new Error('还不知道发给谁：先在企微里给机器人发一条消息')
+      for (const chunk of splitByBytes(text)) await sendChunk(target, chunk)
+    })
+    sendChain = run.catch(() => {})
+    return run
+  }
+
+  const send = text => sendTo(chatId, text)
+
+  function stop() {
+    isStopped = true
+    if (reconnectTimer) timers.clearTimeout(reconnectTimer)
+    stopHeartbeat()
+    failPending('中转已停止')
+    ws?.close()
+  }
+
+  return {
+    start: connect,
+    stop,
+    send,
+    get isConnected() {
+      return isAuthenticated
+    },
+    get chatId() {
+      return chatId
+    },
+  }
+}
+
+// 读 wecom.json。文件不存在返回 null（只用网页窗口）；权限过宽或字段不全时报错，不带出密钥内容。
+export function loadWecomConfig(path, { readFile, stat }) {
+  let st
+  try {
+    st = stat(path)
+  } catch (err) {
+    if (err.code === 'ENOENT') return null
+    throw new Error(`读取 ${path} 失败：${err.message}`)
+  }
+  if ((st.mode & 0o077) !== 0) {
+    throw new Error(`${path} 的权限是 ${(st.mode & 0o777).toString(8)}，含 secret，必须只有本人可读：chmod 600 ${path}`)
+  }
+  let config
+  try {
+    config = JSON.parse(readFile(path, 'utf8'))
+  } catch (err) {
+    throw new Error(`${path} 不是合法 JSON：${err.message}`)
+  }
+  const missing = ['botId', 'secret'].filter(k => typeof config[k] !== 'string' || !config[k])
+  if (missing.length) throw new Error(`${path} 缺少字段：${missing.join('、')}`)
+  if (!Array.isArray(config.allowUsers)) {
+    throw new Error(`${path} 缺少 allowUsers（企微 userid 数组）；不知道自己的 userid 时先填 []，给机器人发条消息就会收到`)
+  }
+  return { botId: config.botId, secret: config.secret, allowUsers: config.allowUsers.map(String) }
+}
+
+// 发往企微的文字：中转自己的提示原样发，会话的回复前面标上会话名。
+export function formatOutgoing({ from, text }) {
+  return from === 'relay' ? text : `**[${from}]**\n${text}`
+}

@@ -9,13 +9,16 @@ export function createRelay({ now = () => Date.now() } = {}) {
   const log = [] // 发往 IM 的消息与收到的 IM 消息，供 IM 适配器按序号拉取
   let seq = 0
   let target = null // 当前默认投递的 sessionId
+  const outgoingListeners = [] // IM 适配器：每条发往 IM 的消息都通知它们
 
   const isOnline = s => now() - s.lastSeen <= ONLINE_WINDOW_MS
   const byName = name => [...sessions.values()].find(s => s.name === name)
 
   function pushLog(entry) {
-    log.push({ seq: ++seq, ts: now(), ...entry })
+    const record = { seq: ++seq, ts: now(), ...entry }
+    log.push(record)
     if (log.length > MAX_LOG) log.splice(0, log.length - MAX_LOG)
+    if (record.dir === 'out') for (const listener of outgoingListeners) listener(record)
   }
   const tell = text => pushLog({ dir: 'out', from: 'relay', text })
 
@@ -133,5 +136,7 @@ export function createRelay({ now = () => Date.now() } = {}) {
 
   const since = n => log.filter(e => e.seq > n)
 
-  return { register, unregister, poll, reply, list, handleIncoming, since }
+  const onOutgoing = listener => outgoingListeners.push(listener)
+
+  return { register, unregister, poll, reply, list, handleIncoming, since, onOutgoing }
 }

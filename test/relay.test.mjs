@@ -48,7 +48,7 @@ before(async () => {
     const timer = setTimeout(() => reject(new Error(`中转 5 秒内没起来：${out}${stderr}`)), 5000)
     child.stdout.on('data', c => {
       out += c
-      if (out.includes('mod 接口') && out.includes('聊天窗口')) {
+      if (out.includes('mod 接口') && out.includes('聊天窗口：http')) {
         clearTimeout(timer)
         resolve()
       }
