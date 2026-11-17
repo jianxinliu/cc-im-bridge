@@ -122,3 +122,19 @@ test('已有中转在跑时，第二个实例拒绝启动', async () => {
   assert.equal(code, 1)
   assert.match(stderr, /已有中转在运行/)
 })
+
+test('审批长轮询：待批时挂起，IM 批准后立即返回', async () => {
+  await request({ socket: true, path: '/mod/register', method: 'POST', body: { sessionId: 's9', name: 'appr', cwd: '' } })
+  const { body } = await request({ socket: true, path: '/mod/approval/request', method: 'POST', body: { sessionId: 's9', tool: 'Bash', summary: 'ls' } })
+  const started = Date.now()
+  const waiting = request({ socket: true, path: '/mod/approval/wait', method: 'POST', body: { id: body.id, timeoutMs: 5000 } })
+  await new Promise(r => setTimeout(r, 200))
+  await request({ path: '/api/send', method: 'POST', body: { text: `/y ${body.id}` }, headers: { 'x-token': token() } })
+  const decided = await waiting
+  assert.equal(decided.body.approval.state, 'approved')
+  assert.ok(Date.now() - started < 3000, '批准后不必等到超时')
+
+  const timedOut = await request({ socket: true, path: '/mod/approval/request', method: 'POST', body: { sessionId: 's9', tool: 'Bash', summary: 'ls' } })
+  const pending = await request({ socket: true, path: '/mod/approval/wait', method: 'POST', body: { id: timedOut.body.id, timeoutMs: 100 } })
+  assert.equal(pending.body.approval.state, 'pending')
+})

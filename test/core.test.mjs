@@ -142,3 +142,63 @@ test('编号在会话登记期间不变；注销后空出的编号给新会话�
   relay.register({ sessionId: 's3', name: 'c', cwd: '' })
   assert.deepEqual(relay.list().map(r => [r.num, r.name]), [[1, 'c'], [2, 'b']])
 })
+
+test('审批：请求发到 IM，/y 编号 批准、/n 编号 原因 拒绝', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  const { id } = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'npm publish' })
+  assert.match(lastReply(), new RegExp(`请求批准 #${id}：Bash\\nnpm publish\\n回复 /y ${id}`))
+  relay.handleIncoming(`/y ${id}`)
+  assert.deepEqual(relay.getApproval({ id }).approval, { id, state: 'approved', reason: '' })
+  assert.match(lastReply(), /已批准/)
+
+  const second = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'rm -rf dist' })
+  relay.handleIncoming(`/n ${second.id} 先别删`)
+  assert.deepEqual(relay.getApproval({ id: second.id }).approval, { id: second.id, state: 'denied', reason: '先别删' })
+})
+
+test('审批：只有一条待批时 /y 可省略编号；多条时要求带编号', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  const a = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'a' })
+  const b = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'b' })
+  relay.handleIncoming('/y')
+  assert.match(lastReply(), new RegExp(`有 2 条待批，请带编号：#${a.id} #${b.id}`))
+  relay.handleIncoming(`/n ${a.id}`)
+  relay.handleIncoming('/y')
+  assert.equal(relay.getApproval({ id: b.id }).approval.state, 'approved')
+  relay.handleIncoming('/y')
+  assert.match(lastReply(), /没有待批的请求/)
+})
+
+test('审批：已决定、已作废的不能再改；作废会告知 IM', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  const { id } = relay.requestApproval({ sessionId: 's1', tool: 'Edit', summary: 'x' })
+  relay.cancelApproval({ id, why: '已在本地处理' })
+  assert.match(lastReply(), new RegExp(`审批 #${id} 已作废：已在本地处理`))
+  relay.handleIncoming(`/y ${id}`)
+  assert.match(lastReply(), /已是「已作废」，不能再改/)
+  assert.equal(relay.getApproval({ id }).approval.state, 'cancelled')
+})
+
+test('审批：超过 15 分钟未答自动超时；/pending 只列待批', () => {
+  const { relay, clock, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  const old = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'old' })
+  clock.advance(15 * 60_000 + 1)
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  const fresh = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'fresh\nsecond line' })
+  assert.equal(relay.getApproval({ id: old.id }).approval.state, 'expired')
+  relay.handleIncoming('/pending')
+  assert.equal(lastReply(), `#${fresh.id} api：Bash fresh`)
+})
+
+test('审批：未登记会话、缺 tool、不存在的编号返回错误', () => {
+  const { relay } = setup()
+  assert.equal(relay.requestApproval({ sessionId: 'nope', tool: 'Bash' }).status, 404)
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  assert.equal(relay.requestApproval({ sessionId: 's1' }).status, 400)
+  assert.equal(relay.getApproval({ id: 99 }).status, 404)
+  assert.equal(relay.cancelApproval({ id: 99 }).status, 404)
+})

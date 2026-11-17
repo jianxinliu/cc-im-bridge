@@ -59,16 +59,44 @@ const modRoutes = {
   'POST /mod/unregister': relay.unregister,
   'POST /mod/poll': relay.poll,
   'POST /mod/reply': relay.reply,
+  'POST /mod/approval/request': relay.requestApproval,
+  'POST /mod/approval/cancel': relay.cancelApproval,
+}
+
+// 长轮询：审批还在待批时最多挂 WAIT_MAX_MS，有结果立即返回；mod 那边循环调用。
+const WAIT_MAX_MS = 25_000
+const approvalWaiters = new Map() // id -> Set<resolve>
+relay.onApprovalChange(a => {
+  for (const resolve of approvalWaiters.get(a.id) ?? []) resolve()
+  approvalWaiters.delete(a.id)
+})
+
+async function waitApproval({ id, timeoutMs }) {
+  const first = relay.getApproval({ id })
+  if (!first.ok || first.approval.state !== 'pending') return first
+  const wait = Math.min(Math.max(Number(timeoutMs) || WAIT_MAX_MS, 0), WAIT_MAX_MS)
+  await new Promise(resolve => {
+    const waiters = approvalWaiters.get(Number(id)) ?? new Set()
+    approvalWaiters.set(Number(id), waiters)
+    const done = () => {
+      clearTimeout(timer)
+      waiters.delete(done)
+      resolve()
+    }
+    const timer = setTimeout(done, wait)
+    waiters.add(done)
+  })
+  return relay.getApproval({ id })
 }
 
 const modServer = http.createServer(async (req, res) => {
   const route = `${req.method} ${req.url}`
   if (route === 'GET /mod/health') return send(res, 200, { ok: true })
   if (route === 'GET /mod/sessions') return send(res, 200, { ok: true, sessions: relay.list() })
-  const handler = modRoutes[route]
+  const handler = route === 'POST /mod/approval/wait' ? waitApproval : modRoutes[route]
   if (!handler) return send(res, 404, { ok: false, error: `没有这个接口：${route}` })
   try {
-    answer(res, handler(await readJson(req)))
+    answer(res, await handler(await readJson(req)))
   } catch (err) {
     send(res, err.status ?? 500, { ok: false, error: `${route} 失败：${err.message}` })
   }

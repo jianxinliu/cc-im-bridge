@@ -1,15 +1,29 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
-const VERSION = '0.1.1'
+const VERSION = '0.2.0'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
 const NAME_PATTERN = /^[\w.\-一-龥]{1,32}$/
 // 提交进会话的 IM 消息都带这个开头；回合开始时据此认出由 IM 发起的回合。
 const IM_MARKER = '[来自 IM 的消息'
+// 审批等待：中转每次最多挂 25 秒，循环 24 次约 10 分钟；按次数而非时钟计，中转异常地立即返回时也会结束。
+const LONG_POLL_MS = 25_000
+const MAX_APPROVAL_POLLS = 24
+const MAX_SUMMARY_CHARS = 1000
+// 这两类必须本人在本地操作，hook 的 allow 关不掉对话框（见 ToolCheckResult.decision 的说明）。
+const PERSON_ONLY_TOOLS = new Set(['AskUserQuestion', 'ExitPlanMode'])
 
 type PushMode = 'im' | 'all' | 'off'
-type RelayAnswer = { status: number; ok: boolean; error?: string; messages?: { text: string }[] }
+type RelayAnswer = {
+  status: number
+  ok: boolean
+  error?: string
+  messages?: { text: string }[]
+  id?: number
+  approval?: { id: number; state: string; reason: string }
+}
+type ImVerdict = { decision: 'allow' | 'deny'; reason: string }
 
 // 模块每个会话加载一份，这里的状态就是本会话的状态；重载后由 session.start 重新填。
 const bridge = {
@@ -24,6 +38,10 @@ const bridge = {
   // 由 IM 消息开启、还没结束的回合 id：这些回合的回复要发回 IM。
   // 按回合 id 认，而不是在取信时计数：取信时上一回合可能还没结束。
   imTurnIds: new Set<string>(),
+  // 主循环当前回合；审批时据此判断这一回合是不是 IM 发起的（人可能不在电脑前）。
+  currentTurnId: '',
+  // 开启后本地发起的回合也把审批转到 IM。
+  isAway: false,
 }
 
 const describe = (err: unknown) => (err instanceof Error ? err.message : String(err))
@@ -128,12 +146,17 @@ async function start($: EngineInterface, cwd: string) {
   bridge.name = String(storedName ?? cwd.split('/').filter(Boolean).pop() ?? 'session')
   const storedMode = await $.store.get(`push:${bridge.sessionId}`)
   bridge.pushMode = storedMode === 'all' || storedMode === 'off' ? storedMode : 'im'
+  bridge.isAway = (await $.store.get(`away:${bridge.sessionId}`)) === true
 
   await $.command.register({ name: 'im-status', description: '查看本会话的 IM 连接状态' })
   await $.command.register({ name: 'im-name', description: '设置本会话在 IM 里的名字：/im-name <名字>' })
   await $.command.register({
     name: 'im-push',
     description: '哪些回复发回 IM：/im-push im（默认，仅 IM 发起的）| all | off',
+  })
+  await $.command.register({
+    name: 'im-away',
+    description: '离开电脑时开启：本地发起的回合需要批准时也发到 IM。/im-away on | off',
   })
   await $.tool.register({
     name: 'send',
@@ -180,6 +203,54 @@ async function stop($: EngineInterface) {
   }
 }
 
+function summarize(input: unknown) {
+  const fields = (input ?? {}) as Record<string, unknown>
+  const text =
+    ['command', 'file_path', 'url', 'path', 'pattern']
+      .map(k => fields[k])
+      .find((v): v is string => typeof v === 'string') ?? JSON.stringify(input ?? {})
+  return text.length > MAX_SUMMARY_CHARS ? `${text.slice(0, MAX_SUMMARY_CHARS)}…` : text
+}
+
+function shouldAskViaIm(tool: string, toolUseId: string | undefined) {
+  if (!toolUseId || !bridge.isRegistered || PERSON_ONLY_TOOLS.has(tool)) return false
+  return bridge.isAway || bridge.imTurnIds.has(bridge.currentTurnId)
+}
+
+// 把审批发到 IM 并等答复；没等到（超时、中断、中转出错）返回 undefined，交回本地审批。
+async function askViaIm($: EngineInterface, tool: string, input: unknown, signal: AbortSignal): Promise<ImVerdict | undefined> {
+  const req = await call($, '/mod/approval/request', { sessionId: bridge.sessionId, tool, summary: summarize(input) })
+  if (!req.ok || req.id === undefined) {
+    report($, `审批转发失败：${req.error ?? req.status}`)
+    return undefined
+  }
+  const id = req.id
+  $.ui.status(`IM：等待 IM 审批 #${id}`)
+  try {
+    for (let i = 0; i < MAX_APPROVAL_POLLS && !signal.aborted; i++) {
+      const r = await call($, '/mod/approval/wait', { id, timeoutMs: LONG_POLL_MS })
+      if (!r.ok || !r.approval) throw new Error(`查询审批 #${id} 失败：${r.error ?? r.status}`)
+      const { state, reason } = r.approval
+      if (state === 'approved') return { decision: 'allow', reason: `用户已在 IM 批准（#${id}）` }
+      if (state === 'denied') return { decision: 'deny', reason: `用户在 IM 拒绝了（#${id}）${reason ? `：${reason}` : ''}` }
+      if (state !== 'pending') return undefined
+    }
+    await call($, '/mod/approval/cancel', { id, why: signal.aborted ? '会话已中断' : '10 分钟未答复，转回电脑上审批' })
+    return undefined
+  } finally {
+    $.ui.status(`IM：${bridge.name}`)
+  }
+}
+
+async function setAway($: EngineInterface, wanted: string) {
+  if (wanted !== 'on' && wanted !== 'off') {
+    return `当前：${bridge.isAway ? 'on' : 'off'}。on：本地发起的回合也把审批转到 IM；off：只转 IM 发起的回合`
+  }
+  bridge.isAway = wanted === 'on'
+  await $.store.set(`away:${bridge.sessionId}`, bridge.isAway)
+  return bridge.isAway ? '已开启：需要批准时都会发到 IM' : '已关闭：只有 IM 发起的回合会把审批发到 IM'
+}
+
 function statusText() {
   return [
     `名字：${bridge.name}`,
@@ -187,6 +258,7 @@ function statusText() {
     `中转：${bridge.socketPath}`,
     `状态：${bridge.problem ?? (bridge.isRegistered ? '已连接' : '未连接')}`,
     `回传：${bridge.pushMode}`,
+    `离开模式：${bridge.isAway ? 'on' : 'off'}`,
   ].join('\n')
 }
 
@@ -201,19 +273,34 @@ export const register: Register = on => {
   ).catch(() => ({ deny: `${PLUGIN}：发送失败，钩子出错` }))
 
   on('turn.start', async ($, e, next) => {
-    if (!e.agentId && e.text.includes(IM_MARKER)) bridge.imTurnIds.add(e.turnId)
+    if (!e.agentId) {
+      bridge.currentTurnId = e.turnId
+      if (e.text.includes(IM_MARKER)) bridge.imTurnIds.add(e.turnId)
+    }
     return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
-    if (!e.agentId) await forwardAnswer($, e.turnId, e.answer, e.isAborted)
+    if (!e.agentId) {
+      if (bridge.currentTurnId === e.turnId) bridge.currentTurnId = ''
+      await forwardAnswer($, e.turnId, e.answer, e.isAborted)
+    }
     return done
   })
+
+  // 引擎判定要问人时，若人可能不在电脑前，就把这次审批转到 IM；IM 没答复则照常本地弹框。
+  on('tool.check', async ($, e, next) => {
+    const verdict = await next(e)
+    if (verdict.decision !== 'ask' || !shouldAskViaIm(e.tool, e.tool_use_id)) return verdict
+    const answer = await askViaIm($, e.tool, e.input, next.signal)
+    return answer ?? verdict
+  }).catch(($, e, next) => next(e))
 
   on('command.run', { command: 'im-status' }, async () => ({ text: statusText() }))
   on('command.run', { command: 'im-name' }, async ($, e) => ({ text: await rename($, e.args.trim()) }))
   on('command.run', { command: 'im-push' }, async ($, e) => ({ text: await setPushMode($, e.args.trim()) }))
+  on('command.run', { command: 'im-away' }, async ($, e) => ({ text: await setAway($, e.args.trim()) }))
 
   on('session.end', async ($, e, next) => {
     await stop($)

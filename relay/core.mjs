@@ -1,8 +1,11 @@
 // 中转的路由逻辑：会话登记、按会话排队、解析 IM 侧的命令。不做任何 I/O，便于测试。
 
 export const ONLINE_WINDOW_MS = 15_000
+export const APPROVAL_TTL_MS = 15 * 60_000
 const MAX_QUEUE = 50
 const MAX_LOG = 500
+
+const STATUS_TEXT = { pending: '待批', approved: '已批准', denied: '已拒绝', cancelled: '已作废', expired: '已超时' }
 
 export function createRelay({ now = () => Date.now() } = {}) {
   const sessions = new Map() // sessionId -> { sessionId, name, cwd, lastSeen, queue: [] }
@@ -10,6 +13,9 @@ export function createRelay({ now = () => Date.now() } = {}) {
   let seq = 0
   let target = null // 当前默认投递的 sessionId
   const outgoingListeners = [] // IM 适配器：每条发往 IM 的消息都通知它们
+  const approvals = new Map() // id -> { id, sessionId, name, tool, summary, status, reason, createdAt }
+  const approvalListeners = [] // 审批状态变化时通知等待者
+  let approvalSeq = 0
 
   const isOnline = s => now() - s.lastSeen <= ONLINE_WINDOW_MS
   const byName = name => [...sessions.values()].find(s => s.name === name)
@@ -148,8 +154,16 @@ export function createRelay({ now = () => Date.now() } = {}) {
       return tell(`之后的消息默认发给 ${s.name}`)
     }
 
+    const decision = text.match(/^\/(y|n)(?:\s+([\s\S]*))?$/)
+    if (decision) return decideFromIm(decision[1] === 'y', decision[2] ?? '')
+
+    if (text === '/pending') {
+      const pending = pendingApprovals()
+      return tell(pending.length === 0 ? '没有待批的请求' : pending.map(a => `#${a.id} ${a.name}：${a.tool} ${a.summary.split('\n')[0]}`).join('\n'))
+    }
+
     if (text === '/help') {
-      return tell('/list 列出会话；/use 编号或名字 切换默认会话；@编号 内容 或 @名字前缀 内容 发给指定会话；其余内容发给上次的会话')
+      return tell('/list 列出会话；/use 编号或名字 切换默认会话；@编号 内容 或 @名字前缀 内容 发给指定会话；其余内容发给上次的会话；/y 编号 批准，/n 编号 原因 拒绝，/pending 查看待批')
     }
 
     const at = text.match(/^@(\S+)\s+([\s\S]+)$/)
@@ -172,5 +186,90 @@ export function createRelay({ now = () => Date.now() } = {}) {
 
   const onOutgoing = listener => outgoingListeners.push(listener)
 
-  return { register, unregister, poll, reply, list, handleIncoming, since, onOutgoing }
+  // ---- 审批 ----
+  function settle(a, status, reason) {
+    a.status = status
+    a.reason = reason
+    for (const listener of approvalListeners) listener(a)
+  }
+
+  function expireOld() {
+    for (const a of approvals.values()) {
+      if (a.status === 'pending' && now() - a.createdAt > APPROVAL_TTL_MS) settle(a, 'expired', '超时')
+    }
+  }
+
+  function requestApproval({ sessionId, tool, summary }) {
+    const s = sessions.get(sessionId)
+    if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
+    if (!tool) return { ok: false, status: 400, error: 'tool 必填' }
+    expireOld()
+    const a = { id: ++approvalSeq, sessionId, name: s.name, tool, summary: summary ?? '', status: 'pending', reason: '', createdAt: now() }
+    approvals.set(a.id, a)
+    pushLog({
+      dir: 'out',
+      from: s.name,
+      text: `请求批准 #${a.id}：${tool}\n${a.summary}\n回复 /y ${a.id} 批准，/n ${a.id} 原因 拒绝`.replace(/\n\n/g, '\n'),
+    })
+    return { ok: true, id: a.id }
+  }
+
+  function getApproval({ id }) {
+    expireOld()
+    const a = approvals.get(Number(id))
+    if (!a) return { ok: false, status: 404, error: `没有审批 #${id}` }
+    return { ok: true, status: 200, approval: { id: a.id, state: a.status, reason: a.reason } }
+  }
+
+  // 会话那边不再等了（本地处理、中断、超时），作废这条审批。
+  function cancelApproval({ id, why }) {
+    const a = approvals.get(Number(id))
+    if (!a) return { ok: false, status: 404, error: `没有审批 #${id}` }
+    if (a.status === 'pending') {
+      settle(a, 'cancelled', why ?? '')
+      tell(`审批 #${a.id} 已作废${why ? `：${why}` : ''}`)
+    }
+    return { ok: true }
+  }
+
+  function pendingApprovals() {
+    expireOld()
+    return [...approvals.values()].filter(a => a.status === 'pending')
+  }
+
+  // IM 里的 /y [编号]、/n [编号] [原因]；只有一条待批时可省略编号。
+  function decideFromIm(isApprove, rest) {
+    const m = rest.match(/^(\d+)?\s*([\s\S]*)$/)
+    const pending = pendingApprovals()
+    let a
+    if (m[1]) {
+      a = approvals.get(Number(m[1]))
+      if (!a) return tell(`没有审批 #${m[1]}`)
+      if (a.status !== 'pending') return tell(`审批 #${a.id} 已是「${STATUS_TEXT[a.status]}」，不能再改`)
+    } else if (pending.length === 1) {
+      a = pending[0]
+    } else {
+      return tell(pending.length === 0 ? '没有待批的请求' : `有 ${pending.length} 条待批，请带编号：${pending.map(p => `#${p.id}`).join(' ')}`)
+    }
+    const reason = (m[2] ?? '').trim()
+    settle(a, isApprove ? 'approved' : 'denied', reason)
+    tell(`#${a.id} ${isApprove ? '已批准' : '已拒绝'}（${a.name}：${a.tool}）`)
+  }
+
+  const onApprovalChange = listener => approvalListeners.push(listener)
+
+  return {
+    register,
+    unregister,
+    poll,
+    reply,
+    list,
+    handleIncoming,
+    since,
+    onOutgoing,
+    requestApproval,
+    getApproval,
+    cancelApproval,
+    onApprovalChange,
+  }
 }
