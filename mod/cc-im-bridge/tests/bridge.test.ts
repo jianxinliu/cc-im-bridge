@@ -32,6 +32,7 @@ function engineBeneath(on: On, sessionId = 'abcd1234-session') {
     submitted.push(e.text)
     return { text: e.text }
   })
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', (_, e) => ({ text: e.answer }))
   mock.store(on)
   mock.env(on, { HOME: '/Users/me' })
@@ -58,11 +59,12 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.1.1' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
 
+  await $.turn.start({ text: submitted[0] ?? '', turnId: 't1' })
   await $.turn.complete({ answer: '测试全部通过', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
   expect(calls.at(-1)).toEqual({ path: '/mod/reply', body: { sessionId: 'abcd1234-session', text: '测试全部通过' } })
 })
@@ -138,4 +140,29 @@ test('/im-name 校验名字并重新登记', async ($, on) => {
   const good = await $.command.run({ command: 'im-name', args: '后端' })
   expect(good.text).toBe('本会话在 IM 里的名字改为 后端')
   expect(calls.at(-1)?.body.name).toBe('后端')
+})
+
+test('取信时上一轮还在跑：上一轮的回复不发 IM，IM 那一轮的回复才发', async ($, on) => {
+  let pending = [{ text: '链路测试' }]
+  const calls = fakeRelay(on, {
+    '/mod/poll': () => {
+      const messages = pending
+      pending = []
+      return { ok: true, messages }
+    },
+  })
+  const { submitted, clock } = engineBeneath(on)
+  await startSession($)
+
+  // 本地回合 t0 进行中，mod 取到 IM 消息并排队提交
+  await $.turn.start({ text: '本地的提问', turnId: 't0' })
+  await clock.advance(2000)
+  await $.turn.complete({ answer: '本地回合的结束语', durationMs: 10, isAborted: false, turnId: 't0', reason: 'answer' })
+  expect(calls.some(c => c.path === '/mod/reply')).toBe(false)
+
+  // 会话空闲后，排队的 IM 消息开启 t1
+  await $.turn.start({ text: submitted[0] ?? '', turnId: 't1' })
+  await $.turn.complete({ answer: '收到，链路正常', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
+  const replies = calls.filter(c => c.path === '/mod/reply').map(c => c.body.text)
+  expect(replies).toEqual(['收到，链路正常'])
 })

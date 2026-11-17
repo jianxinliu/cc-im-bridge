@@ -19,7 +19,7 @@ export function createRelay({ now = () => Date.now() } = {}) {
   }
   const tell = text => pushLog({ dir: 'out', from: 'relay', text })
 
-  function register({ sessionId, name, cwd }) {
+  function register({ sessionId, name, cwd, version }) {
     if (!sessionId || !name) return { ok: false, status: 400, error: 'sessionId 和 name 必填' }
     const holder = byName(name)
     if (holder && holder.sessionId !== sessionId && isOnline(holder)) {
@@ -31,6 +31,7 @@ export function createRelay({ now = () => Date.now() } = {}) {
       sessionId,
       name,
       cwd: cwd ?? '',
+      version: version ?? '',
       lastSeen: now(),
       queue: existing?.queue ?? [],
     })
@@ -67,6 +68,7 @@ export function createRelay({ now = () => Date.now() } = {}) {
     return [...sessions.values()].map(s => ({
       name: s.name,
       cwd: s.cwd,
+      version: s.version,
       online: isOnline(s),
       queued: s.queue.length,
       current: s.sessionId === target,

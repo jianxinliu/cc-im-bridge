@@ -13,7 +13,8 @@ function setup() {
 
 test('只有一个在线会话时，普通消息直接投给它', () => {
   const { relay, lastReply } = setup()
-  relay.register({ sessionId: 's1', name: 'api', cwd: '/w/api' })
+  relay.register({ sessionId: 's1', name: 'api', cwd: '/w/api', version: '0.1.1' })
+  assert.equal(relay.list()[0].version, '0.1.1')
   relay.handleIncoming('跑测试')
   assert.equal(lastReply(), '→ api')
   assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['跑测试'])

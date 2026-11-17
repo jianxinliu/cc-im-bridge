@@ -1,9 +1,12 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
+const VERSION = '0.1.1'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
 const NAME_PATTERN = /^[\w.\-一-龥]{1,32}$/
+// 提交进会话的 IM 消息都带这个开头；回合开始时据此认出由 IM 发起的回合。
+const IM_MARKER = '[来自 IM 的消息'
 
 type PushMode = 'im' | 'all' | 'off'
 type RelayAnswer = { status: number; ok: boolean; error?: string; messages?: { text: string }[] }
@@ -18,8 +21,9 @@ const bridge = {
   isRegistered: false,
   isPolling: false,
   problem: undefined as string | undefined,
-  // 由 IM 消息开启、还没结束的回合数：这些回合的回复要发回 IM。
-  imTurnsOpen: 0,
+  // 由 IM 消息开启、还没结束的回合 id：这些回合的回复要发回 IM。
+  // 按回合 id 认，而不是在取信时计数：取信时上一回合可能还没结束。
+  imTurnIds: new Set<string>(),
 }
 
 const describe = (err: unknown) => (err instanceof Error ? err.message : String(err))
@@ -40,11 +44,11 @@ async function call($: EngineInterface, path: string, body: unknown): Promise<Re
 
 async function ensureRegistered($: EngineInterface) {
   const { sessionId, cwd } = bridge
-  let r = await call($, '/mod/register', { sessionId, name: bridge.name, cwd })
+  let r = await call($, '/mod/register', { sessionId, name: bridge.name, cwd, version: VERSION })
   if (r.status === 409) {
     // 同名会话在线时，带上会话 id 前缀区分。
     bridge.name = `${bridge.name}-${sessionId.slice(0, 4)}`
-    r = await call($, '/mod/register', { sessionId, name: bridge.name, cwd })
+    r = await call($, '/mod/register', { sessionId, name: bridge.name, cwd, version: VERSION })
   }
   if (!r.ok) throw new Error(`登记会话 ${bridge.name} 失败：${r.error ?? r.status}`)
   bridge.isRegistered = true
@@ -70,9 +74,8 @@ async function tick($: EngineInterface) {
     if (!r.ok) throw new Error(`取信失败：${r.error ?? r.status}`)
     report($, undefined)
     for (const m of r.messages ?? []) {
-      bridge.imTurnsOpen++
       await $.prompt.submit({
-        text: `[来自 IM 的消息，本轮最终回复会自动发回 IM，请简洁]\n${m.text}`,
+        text: `${IM_MARKER}，本轮最终回复会自动发回 IM，请简洁]\n${m.text}`,
       })
     }
   } catch (err) {
@@ -146,9 +149,8 @@ async function start($: EngineInterface, cwd: string) {
   $.clock.every(POLL_MS, () => void tick($))
 }
 
-async function forwardAnswer($: EngineInterface, answer: string, isAborted: boolean) {
-  const fromIm = bridge.imTurnsOpen > 0
-  if (fromIm) bridge.imTurnsOpen--
+async function forwardAnswer($: EngineInterface, turnId: string, answer: string, isAborted: boolean) {
+  const fromIm = bridge.imTurnIds.delete(turnId)
   if (bridge.pushMode === 'off' || (bridge.pushMode === 'im' && !fromIm)) return
   const text = isAborted ? '（本轮被中断）' : answer.trim() || '（本轮没有文字回复）'
   try {
@@ -198,9 +200,14 @@ export const register: Register = on => {
     sendFromTool($, String((e as { text?: unknown }).text ?? '').trim()),
   ).catch(() => ({ deny: `${PLUGIN}：发送失败，钩子出错` }))
 
+  on('turn.start', async ($, e, next) => {
+    if (!e.agentId && e.text.includes(IM_MARKER)) bridge.imTurnIds.add(e.turnId)
+    return next(e)
+  })
+
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
-    if (!e.agentId) await forwardAnswer($, e.answer, e.isAborted)
+    if (!e.agentId) await forwardAnswer($, e.turnId, e.answer, e.isAborted)
     return done
   })
 
