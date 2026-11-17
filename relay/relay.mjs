@@ -196,6 +196,7 @@ try {
       initialChatId,
       WebSocketImpl: MiniWebSocket,
       onText: text => relay.handleIncoming(text),
+      onUseSession: num => (relay.useSession(num).ok ? relay.list() : null),
       onCardAction: ({ id, approve }) => {
         const r = relay.decideApproval({ id, approve })
         return r.approval ?? null
@@ -203,7 +204,12 @@ try {
       onChatId: chatId => writeFileSync(WECOM_STATE, JSON.stringify({ chatId }) + '\n', { mode: 0o600 }),
     })
     relay.onOutgoing(entry =>
-      (entry.approval ? wecom.sendApprovalCard(entry.approval, formatOutgoing(entry)) : wecom.send(formatOutgoing(entry))).catch(
+      (entry.approval
+        ? wecom.sendApprovalCard(entry.approval, formatOutgoing(entry))
+        : entry.sessions
+          ? wecom.sendSessionsCard(entry.sessions, formatOutgoing(entry))
+          : wecom.send(formatOutgoing(entry))
+      ).catch(
         err => console.error(`发往企微失败：${err.message}`),
       ),
     )

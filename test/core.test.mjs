@@ -289,3 +289,52 @@ test('decideApproval：已有结果的不改，返回当前结果', () => {
   assert.deepEqual([again.ok, again.status, again.state], [false, 409, 'approved'])
   assert.equal(relay.decideApproval({ id: 99, approve: true }).status, 404)
 })
+
+test('「会话」「有哪些会话」列出会话，并带结构化列表供 IM 画卡片', () => {
+  const { relay } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '/w/api' })
+  relay.register({ sessionId: 's2', name: 'web', cwd: '/w/web' })
+  for (const say of ['会话', '有哪些会话', '/list']) {
+    relay.handleIncoming(say)
+    const last = relay.since(0).at(-1)
+    assert.deepEqual(last.sessions.map(r => [r.num, r.name]), [[1, 'api'], [2, 'web']], say)
+    assert.match(last.text, /1\. api/)
+  }
+})
+
+test('「切到 web」「换到 2」切换当前会话，之后不带名字的消息发给它', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.register({ sessionId: 's2', name: 'web', cwd: '' })
+  relay.handleIncoming('切到 web')
+  assert.equal(lastReply(), '之后的消息发给 web')
+  relay.handleIncoming('改个按钮颜色')
+  relay.handleIncoming('换到1')
+  relay.handleIncoming('跑测试')
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).messages.map(m => m.text), ['改个按钮颜色'])
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['跑测试'])
+  relay.handleIncoming('切到 nope')
+  assert.match(lastReply(), /没有名为 nope 的会话/)
+})
+
+test('「名字：内容」发给该会话并成为当前会话；冒号前不是完整会话名时整句原样发给当前会话', () => {
+  const { relay } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.register({ sessionId: 's2', name: 'web', cwd: '' })
+  relay.handleIncoming('/use web')
+  relay.handleIncoming('注意：这句发给当前会话')
+  relay.handleIncoming('ap：前缀不算')
+  relay.handleIncoming('api：改接口')
+  relay.handleIncoming('WEB: 再加个边框')
+  relay.handleIncoming('1：第三条')
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).messages.map(m => m.text), ['注意：这句发给当前会话', 'ap：前缀不算', '再加个边框'])
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['改接口', '第三条'])
+})
+
+test('useSession：按编号切换并返回名字；不存在时报错', () => {
+  const { relay } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  assert.deepEqual(relay.useSession(1), { ok: true, name: 'api', num: 1 })
+  assert.equal(relay.list()[0].current, true)
+  assert.equal(relay.useSession(9).ok, false)
+})

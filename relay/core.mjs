@@ -10,6 +10,8 @@ export const STATUS_TEXT = { pending: '待批', approved: '已批准', denied: '
 // 批准词只收明确的肯定；拒绝方向放宽一些，误判也只是不执行。
 const APPROVE_WORDS = new Set(['好', '好的', '好啊', '可以', '行', '批准', '同意', '确认', 'ok'])
 const DENY_WORDS = ['不行', '不可以', '不要', '不用', '拒绝', '不同意', '先别', '别', '不', 'no', 'n']
+const LIST_PHRASES = new Set(['/list', '/ls', '会话', '会话列表', '有哪些会话', '列一下会话', '列出会话', '看看会话'])
+const USE_PATTERN = /^(?:\/use|切到|切换到|换到)\s*(\S+)$/
 
 export function createRelay({ now = () => Date.now() } = {}) {
   const sessions = new Map() // sessionId -> { sessionId, name, cwd, lastSeen, queue: [] }
@@ -140,24 +142,23 @@ export function createRelay({ now = () => Date.now() } = {}) {
     if (!text) return
     pushLog({ dir: 'in', from: 'me', text })
 
-    if (text === '/list' || text === '/ls') {
+    if (LIST_PHRASES.has(text)) {
       const rows = list()
-      tell(
-        rows.length === 0
-          ? '没有已登记的会话'
-          : rows
-              .map(r => `${r.current ? '*' : ' '} ${r.num}. ${r.name}${r.online ? '' : '（离线）'}  ${r.cwd}`)
-              .join('\n'),
-      )
+      if (rows.length === 0) return tell('没有已登记的会话')
+      pushLog({
+        dir: 'out',
+        from: 'relay',
+        text: rows.map(r => `${r.current ? '*' : ' '} ${r.num}. ${r.name}${r.online ? '' : '（离线）'}  ${r.cwd}`).join('\n'),
+        // IM 适配器据此画成每个会话一个按钮的卡片。
+        sessions: rows,
+      })
       return
     }
 
-    const use = text.match(/^\/use\s+(\S+)$/)
+    const use = text.match(USE_PATTERN)
     if (use) {
-      const { session: s, error } = resolve(use[1])
-      if (!s) return tell(error)
-      target = s.sessionId
-      return tell(`之后的消息默认发给 ${s.name}`)
+      const r = useSession(use[1])
+      return tell(r.ok ? `之后的消息发给 ${r.name}` : r.error)
     }
 
     const decision = text.match(/^\/(y|n)(?:\s+([\s\S]*))?$/)
@@ -171,7 +172,7 @@ export function createRelay({ now = () => Date.now() } = {}) {
     }
 
     if (text === '/help') {
-      return tell('/list 列出会话；/use 编号或名字 切换默认会话；@编号 内容 或 @名字前缀 内容 发给指定会话；其余内容发给上次的会话。审批：点卡片按钮，或回「好」「不行，原因」；/pending 查看待批')
+      return tell('发「会话」点选要聊的会话，或说「切到 名字」；「名字：内容」直接发给某个会话；其余内容发给当前会话。审批：点卡片按钮，或回「好」「不行，原因」；/pending 查看待批')
     }
 
     const at = text.match(/^@(\S+)\s+([\s\S]+)$/)
@@ -181,13 +182,30 @@ export function createRelay({ now = () => Date.now() } = {}) {
       return deliver(s, at[2])
     }
 
+    // 「api：跑一下测试」：冒号前是某个会话的完整名字或编号时，发给它；
+    // 只认完整名字，避免「注意：xxx」这类普通句子被误当成会话名。
+    const named = text.match(/^([^\s:：]{1,32})\s*[：:]\s*([\s\S]+)$/)
+    if (named) {
+      const key = named[1].toLowerCase()
+      const s = [...sessions.values()].find(x => x.name.toLowerCase() === key || String(x.num) === key)
+      if (s) return deliver(s, named[2])
+    }
+
     let s = target ? sessions.get(target) : undefined
     if (!s) {
       const online = [...sessions.values()].filter(isOnline)
       if (online.length === 1) s = online[0]
     }
-    if (!s) return tell('不确定发给哪个会话：先 /use 编号，或用 @编号 开头。发 /list 查看')
+    if (!s) return tell('不确定发给哪个会话：发「会话」点选一个，或说「切到 名字」')
     deliver(s, text)
+  }
+
+  // 切换之后不带会话名的消息发给谁。ref 可以是编号、名字或唯一前缀。
+  function useSession(ref) {
+    const { session: s, error } = resolve(String(ref))
+    if (!s) return { ok: false, error }
+    target = s.sessionId
+    return { ok: true, name: s.name, num: s.num }
   }
 
   const since = n => log.filter(e => e.seq > n)
@@ -345,6 +363,7 @@ export function createRelay({ now = () => Date.now() } = {}) {
     cancelApproval,
     onApprovalChange,
     decideApproval,
+    useSession,
     tell,
     setForward,
     hookPermission,

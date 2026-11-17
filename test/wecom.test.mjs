@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { approvalCard, createWecomAdapter, extractText, formatOutgoing, loadWecomConfig, parseCardKey, splitByBytes } from '../relay/wecom.mjs'
+import { approvalCard, createWecomAdapter, sessionsCard, extractText, formatOutgoing, loadWecomConfig, parseCardKey, splitByBytes } from '../relay/wecom.mjs'
 
 // 假 WebSocket：记录发出的帧，测试用 serverSays 模拟服务端下发。
 function fakeSocketFactory() {
@@ -463,4 +463,56 @@ test('卡片点击：旧版 SDK 写法（key 直接在 event 下）也能识别'
     body: { msgid: 'flat1', from: { userid: 'alice' }, msgtype: 'event', event: { eventtype: 'template_card_event', event_key: 'appr:3:n', task_id: taskId } },
   })
   assert.deepEqual(actions, [{ id: 3, approve: false }])
+})
+
+const rows = [
+  { num: 1, name: 'api', cwd: '/w/api', online: true, current: false },
+  { num: 2, name: 'web-frontend-long-name', cwd: '/w/web', online: false, current: true },
+]
+
+test('会话卡片：每个会话一个按钮，当前会话标 ✓，按钮文字不超 10 字，最多 6 个', () => {
+  const card = sessionsCard(rows, 'p_s1')
+  assert.equal(card.card_type, 'button_interaction')
+  assert.equal(card.main_title.desc, '当前：web-frontend-long-name')
+  assert.equal(card.sub_title_text, '1. api\n2. web-frontend-long-name（离线）')
+  assert.deepEqual(card.button_list.map(b => [b.text, b.key, b.style]), [['api', 'use:1', 2], ['✓ web-fron', 'use:2', 1]])
+  const many = Array.from({ length: 8 }, (_, i) => ({ num: i + 1, name: `s${i + 1}`, cwd: '', online: true, current: false }))
+  const big = sessionsCard(many, 'p_s2')
+  assert.equal(big.button_list.length, 6)
+  assert.match(big.sub_title_text, /还有 2 个，说「切到 名字」/)
+})
+
+test('点会话按钮：切换会话，并用事件 req_id 把卡片重画成新的当前会话', async () => {
+  const picks = []
+  const { socket, authOk, adapter } = setup({
+    onUseSession: num => (picks.push(num), rows.map(r => ({ ...r, current: r.num === num }))),
+  })
+  authOk()
+  socket().serverSays(textFrame('alice', 'hi'))
+  const sending = adapter.sendSessionsCard(rows, 'x')
+  await tick()
+  const taskId = socket().lastSent().body.template_card.task_id
+  ackLast(socket())
+  await sending
+
+  const evt = cardEvent('alice', 'use:1', {}, taskId)
+  socket().serverSays(evt)
+  assert.deepEqual(picks, [1])
+  const update = socket().lastSent()
+  assert.equal(update.cmd, 'aibot_respond_update_msg')
+  assert.equal(update.headers.req_id, evt.headers.req_id)
+  assert.equal(update.body.template_card.main_title.desc, '当前：api')
+  assert.equal(update.body.template_card.task_id, taskId)
+})
+
+test('点会话按钮：旧卡片不生效；会话已不存在时提示重新发「会话」', async () => {
+  const picks = []
+  const { socket, authOk } = setup({ onUseSession: num => (picks.push(num), null) })
+  authOk()
+  socket().serverSays(textFrame('alice', 'hi'))
+  socket().serverSays(cardEvent('alice', 'use:1', {}, 'ccim_old_s1'))
+  await tick()
+  assert.deepEqual(picks, [])
+  assert.match(socket().lastSent().body.markdown.content, /会话卡片已过期/)
+  ackLast(socket())
 })

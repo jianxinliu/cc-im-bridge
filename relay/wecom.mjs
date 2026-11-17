@@ -44,6 +44,31 @@ export function parseCardKey(key) {
   return m ? { id: Number(m[1]), approve: m[2] === 'y' } : null
 }
 
+const MAX_SESSION_BUTTONS = 6 // 企微按钮卡片最多 6 个按钮
+const SESSION_KEY = /^use:(\d+)$/
+
+// 会话列表卡片：每个会话一个按钮，当前会话标 ✓。
+export function sessionsCard(rows, taskId) {
+  const shown = rows.slice(0, MAX_SESSION_BUTTONS)
+  const extra = rows.length - shown.length
+  const current = rows.find(r => r.current)
+  return {
+    card_type: 'button_interaction',
+    source: { desc: 'cc-im-bridge' },
+    main_title: { title: '选择会话', desc: current ? `当前：${current.name}` : '点一个，之后的消息发给它' },
+    sub_title_text:
+      rows.map(r => `${r.num}. ${r.name}${r.online ? '' : '（离线）'}`).join('\n') +
+      (extra > 0 ? `\n还有 ${extra} 个，说「切到 名字」` : ''),
+    card_action: { type: 0 },
+    task_id: taskId,
+    button_list: shown.map(r => ({
+      text: `${r.current ? '✓ ' : ''}${r.name}`.slice(0, 10),
+      style: r.current ? 1 : 2,
+      key: `use:${r.num}`,
+    })),
+  }
+}
+
 export function splitByBytes(text, maxBytes = CHUNK_BYTES) {
   const encoder = new TextEncoder()
   const chunks = []
@@ -86,6 +111,8 @@ export function createWecomAdapter({
   onText,
   // 用户点了审批卡片的按钮：({ id, approve }) => 当前审批对象（含 status），用于把卡片更新成结论。
   onCardAction = () => null,
+  // 用户点了会话卡片的按钮：(num) => 最新的会话列表（含 current），用于重画卡片；切换失败返回 null。
+  onUseSession = () => null,
   onChatId = () => {},
   initialChatId = '',
   log = console,
@@ -110,6 +137,7 @@ export function createWecomAdapter({
   let sendChain = Promise.resolve()
   const taskPrefix = `ccim_${Math.random().toString(36).slice(2, 10)}`
   const cards = new Map() // 审批编号 -> 发出时的卡片内容，用于点按钮后更新
+  let sessionCardSeq = 0
 
   const reqId = prefix => `${prefix}_${Date.now()}_${++seq}`
   const write = frame => ws.send(JSON.stringify(frame))
@@ -184,6 +212,9 @@ export function createWecomAdapter({
     const eventKey = detail.event_key ?? body.event?.event_key
     // 结论定了之后卡片上只剩一个灰色按钮，点它不做任何事。
     if (/^appr:\d+:done$/.test(eventKey ?? '')) return
+    const taskId = detail.task_id ?? body.event?.task_id
+    const useMatch = SESSION_KEY.exec(eventKey ?? '')
+    if (useMatch) return handleSessionPick(frame, Number(useMatch[1]), taskId)
     const action = parseCardKey(eventKey)
     if (!action) {
       log.warn(`企微：卡片点击无法识别 event_key=${JSON.stringify(eventKey)} 内层字段=${Object.keys(detail).join(',')}`)
@@ -191,7 +222,6 @@ export function createWecomAdapter({
     }
     // 审批编号每次启动中转都从 1 重新计，旧卡片的按钮 key 会和新审批撞上；
     // 只认本次启动发出的卡片（task_id 带本次的随机前缀）。
-    const taskId = detail.task_id ?? body.event?.task_id
     if (taskId !== `${taskPrefix}_${action.id}`) {
       log.warn(`企微：忽略过期卡片的点击 task_id=${JSON.stringify(taskId)} key=${eventKey}`)
       send('这张卡片已过期（中转重启过），不会生效，请用最新的卡片').catch(err => log.warn(`企微：${err.message}`))
@@ -209,6 +239,29 @@ export function createWecomAdapter({
       log.warn(`企微：更新审批卡片 #${action.id} 失败：${err.message}`)
       // 卡片没能变样时，用一条文字告诉结论，免得用户以为没点上。
       send(card.main_title.desc).catch(e => log.warn(`企微：补发审批结论失败：${e.message}`))
+    })
+  }
+
+  // 点会话卡片的按钮：切到该会话，并把卡片重画成新的当前会话。
+  // 编号在会话登记期间不变，但中转重启后会重排，所以同样只认本次启动发出的卡片。
+  function handleSessionPick(frame, num, taskId) {
+    if (!String(taskId ?? '').startsWith(`${taskPrefix}_s`)) {
+      log.warn(`企微：忽略过期会话卡片的点击 task_id=${JSON.stringify(taskId)}`)
+      send('这张会话卡片已过期（中转重启过），请重新发「会话」').catch(err => log.warn(`企微：${err.message}`))
+      return
+    }
+    const rows = onUseSession(num)
+    if (!rows) {
+      send(`会话 ${num} 已不存在，请重新发「会话」`).catch(err => log.warn(`企微：${err.message}`))
+      return
+    }
+    writeAndWait('aibot_respond_update_msg', frame.headers?.req_id, {
+      response_type: 'update_template_card',
+      template_card: sessionsCard(rows, taskId),
+    }).catch(err => {
+      log.warn(`企微：更新会话卡片失败：${err.message}`)
+      const current = rows.find(r => r.current)
+      send(`之后的消息发给 ${current?.name ?? num}`).catch(e => log.warn(`企微：${e.message}`))
     })
   }
 
@@ -351,6 +404,24 @@ export function createWecomAdapter({
 
   const send = text => sendTo(chatId, text)
 
+  function sendSessionsCard(rows, fallbackText) {
+    const run = sendChain.then(async () => {
+      if (!chatId) throw new Error('还不知道发给谁：先在企微里给机器人发一条消息')
+      try {
+        await writeAndWait('aibot_send_msg', reqId('aibot_send_msg'), {
+          chatid: chatId,
+          msgtype: 'template_card',
+          template_card: sessionsCard(rows, `${taskPrefix}_s${++sessionCardSeq}`),
+        })
+      } catch (err) {
+        log.warn(`企微：会话卡片发送失败，改发文字：${err.message}`)
+        for (const chunk of splitByBytes(fallbackText)) await sendChunk(chatId, chunk)
+      }
+    })
+    sendChain = run.catch(() => {})
+    return run
+  }
+
   function stop() {
     isStopped = true
     if (reconnectTimer) timers.clearTimeout(reconnectTimer)
@@ -364,6 +435,7 @@ export function createWecomAdapter({
     stop,
     send,
     sendApprovalCard,
+    sendSessionsCard,
     get isConnected() {
       return isAuthenticated
     },
