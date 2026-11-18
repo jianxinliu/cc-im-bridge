@@ -607,3 +607,21 @@ test('建议：发「建议」对当前会话生成；会话出错时转告；�
   relay.handleIncoming('1')
   assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['1'])
 })
+
+test('在电脑上开离开模式：通知 IM、不给它自己再下发、让原来遥控中的会话退出、不生成建议', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.register({ sessionId: 's2', name: 'web', cwd: '' })
+  relay.handleIncoming('离开 api')
+  relay.poll({ sessionId: 's1' })
+
+  relay.awayFromSession({ sessionId: 's2', on: true })
+  assert.match(lastReply(), /^正在遥控 web：.*（api 已退出遥控）/)
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).controls, [], '它自己已经开了，不再下发；也不生成建议')
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).controls, [{ type: 'away', on: false }])
+
+  relay.awayFromSession({ sessionId: 's2', on: false })
+  assert.equal(lastReply(), 'web 已退出遥控（在电脑上关闭）')
+  assert.equal(relay.list().some(r => r.away), false)
+  assert.equal(relay.awayFromSession({ sessionId: 'nope', on: true }).status, 404)
+})

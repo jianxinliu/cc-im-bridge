@@ -1,7 +1,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
-const VERSION = '0.7.0'
+const VERSION = '0.7.1'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
 const MAX_NAME_CHARS = 32
@@ -274,13 +274,22 @@ async function settleLocal($: EngineInterface, body: { tool?: string; summary?: 
   }
 }
 
-async function setAway($: EngineInterface, wanted: string) {
+// source：local 为在电脑上执行 /im-away，要通知 IM；im 为 IM 里说的，中转已经回复过。
+async function setAway($: EngineInterface, wanted: string, source: 'local' | 'im' = 'local') {
   if (wanted !== 'on' && wanted !== 'off') {
     return `当前：${bridge.isAway ? 'on' : 'off'}。on：离开电脑，本会话的回复、审批、提问都发到 IM；off：只有 IM 发起的回合才发`
   }
+  const changed = bridge.isAway !== (wanted === 'on')
   bridge.isAway = wanted === 'on'
   await $.store.set(`away:${bridge.sessionId}`, bridge.isAway)
   await pushForward($)
+  if (source === 'local' && changed && bridge.isRegistered) {
+    try {
+      await call($, '/mod/away', { sessionId: bridge.sessionId, on: bridge.isAway })
+    } catch (err) {
+      report($, `通知 IM 失败：${describe(err)}`)
+    }
+  }
   $.ui.status(bridge.isAway ? `IM：${bridge.name}（离开模式）` : `IM：${bridge.name}`)
   return bridge.isAway ? '已开启离开模式：回复、审批、提问都会发到 IM' : '已关闭离开模式'
 }
@@ -341,7 +350,7 @@ async function suggestNext($: EngineInterface) {
 async function applyControl($: EngineInterface, control: Control) {
   try {
     if (control.type === 'away') {
-      await setAway($, control.on ? 'on' : 'off')
+      await setAway($, control.on ? 'on' : 'off', 'im')
       return
     }
     if (control.type === 'suggest') {

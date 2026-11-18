@@ -339,6 +339,22 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     return online.length === 1 ? online[0] : undefined
   }
 
+  // 在电脑上执行 /im-away on|off：通知 IM，并保持同一时间只遥控一个会话。
+  function awayFromSession({ sessionId, on }) {
+    const s = sessions.get(sessionId)
+    if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
+    if (on) {
+      // 会话自己已经开了，不必再给它下发开启指令。
+      s.away = true
+      const r = awaySession(s.num, { suggest: false })
+      tell(r.message)
+      return { ok: true }
+    }
+    s.away = false
+    tell(`${label(s)} 已退出遥控（在电脑上关闭）`)
+    return { ok: true }
+  }
+
   // 让会话插件按上下文生成几条下一步建议（插件调模型，结果经 suggestions() 回来）。
   function requestSuggestions(s) {
     if (!isOnline(s) || s.controls.some(c => c.type === 'suggest')) return
@@ -388,7 +404,8 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
 
   // 遥控一个会话：它进入离开模式并成为当前会话；同一时间只遥控一个，其他会话退出离开模式，
   // 否则多个会话的回复会一起涌进 IM。
-  function awaySession(ref) {
+  // suggest：是否顺带生成下一步建议。在电脑上开的不需要（人还在电脑前），省一次模型调用。
+  function awaySession(ref, { suggest = true } = {}) {
     const { session: s, error } = resolve(String(ref))
     if (!s) return { ok: false, error }
     const released = []
@@ -401,7 +418,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     if (!s.away) s.controls.push({ type: 'away', on: true })
     s.away = true
     setTarget(s.sessionId)
-    requestSuggestions(s)
+    if (suggest) requestSuggestions(s)
     const switched = released.length ? `（${released.join('、')} 已退出遥控）` : ''
     return {
       ok: true,
@@ -721,6 +738,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     decideApproval,
     useSession,
     awaySession,
+    awayFromSession,
     suggestions,
     sendSuggestion,
     fileOut,

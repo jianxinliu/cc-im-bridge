@@ -64,7 +64,7 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.7.0' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.7.1' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
@@ -377,4 +377,19 @@ test('send 工具发文件：把路径和说明交给中转；中转拒绝时告
   reject = true
   const denied = await $.tool.call({ tool: 'mcp__cc-im-bridge__send', file: '/tmp/big.zip' })
   expect(denied.deny).toBe('文件没发出：文件 25.0MB，超过企微 20MB 的上限')
+})
+
+test('在电脑上 /im-away 开关时通知中转；IM 里说「离开」触发的不再通知；没变化时不通知', async ($, on) => {
+  const pending: object[][] = []
+  const calls = fakeRelay(on, { '/mod/poll': () => ({ ok: true, messages: [], controls: pending.shift() ?? [] }) })
+  const { clock } = engineBeneath(on)
+  await startSession($)
+  await clock.advance(2000)
+
+  await $.command.run({ command: 'im-away', args: 'on' })
+  await $.command.run({ command: 'im-away', args: 'on' })
+  await $.command.run({ command: 'im-away', args: 'off' })
+  pending.push([{ type: 'away', on: true }])
+  await clock.advance(2000)
+  expect(calls.filter(c => c.path === '/mod/away').map(c => c.body.on)).toEqual([true, false])
 })

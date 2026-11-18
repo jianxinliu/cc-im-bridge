@@ -124,6 +124,7 @@ const modRoutes = {
   'POST /mod/progress': relay.progress,
   'POST /mod/suggestions': relay.suggestions,
   'POST /mod/file': sendFileFromSession,
+  'POST /mod/away': relay.awayFromSession,
   'POST /mod/approval/request': relay.requestApproval,
   'POST /mod/approval/cancel': relay.cancelApproval,
   'POST /mod/forward': relay.setForward,
