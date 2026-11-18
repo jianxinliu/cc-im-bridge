@@ -2,6 +2,7 @@
 // 本地中转：Unix socket 给各会话的 mod 用；IM 端是企业微信（配置了 wecom.json 时）和 127.0.0.1 上的网页聊天窗口。
 import { randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { isAbsolute } from 'node:path'
 import http from 'node:http'
 import net from 'node:net'
 import { homedir } from 'node:os'
@@ -9,6 +10,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { createRelay } from './core.mjs'
+import { outboundKind, safeFilename, sniffExtension } from './media.mjs'
 import { createTitleReader } from './titles.mjs'
 import { createWecomAdapter, formatOutgoing, loadWecomConfig } from './wecom.mjs'
 import { MiniWebSocket } from './ws-client.mjs'
@@ -81,6 +83,39 @@ function answer(res, result) {
 }
 
 // ---- 给 mod 用的 Unix socket ----
+// ---- 附件 ----
+const INBOX = join(HOME, 'inbox')
+
+// 收到的附件存进 inbox/日期/，权限只给本人；返回存好的路径。
+function saveInbound({ buffer, filename }) {
+  const now = new Date()
+  const day = now.toISOString().slice(0, 10)
+  const dir = join(INBOX, day)
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  const stamp = now.toTimeString().slice(0, 8).replace(/:/g, '')
+  const base = safeFilename(filename, sniffExtension(buffer))
+  let path = join(dir, `${stamp}-${base}`)
+  for (let i = 2; existsSync(path); i++) path = join(dir, `${stamp}-${i}-${base}`)
+  writeFileSync(path, buffer, { mode: 0o600 })
+  return path
+}
+
+// 会话请求发送本机文件：先核对路径和大小，不合格直接告诉会话，合格再交给中转排进发送。
+function sendFileFromSession({ sessionId, path, caption }) {
+  if (typeof path !== 'string' || !isAbsolute(path)) return { ok: false, status: 400, error: 'path 要写绝对路径' }
+  let st
+  try {
+    st = statSync(path)
+  } catch (err) {
+    return { ok: false, status: 400, error: `读不到文件 ${path}：${err.code ?? err.message}` }
+  }
+  if (!st.isFile()) return { ok: false, status: 400, error: `${path} 不是普通文件` }
+  const name = path.split('/').pop()
+  const decided = outboundKind(name, st.size)
+  if (decided.error) return { ok: false, status: 400, error: decided.error }
+  return relay.fileOut({ sessionId, path, name, kind: decided.kind, caption })
+}
+
 const modRoutes = {
   'POST /mod/register': relay.register,
   'POST /mod/unregister': relay.unregister,
@@ -88,6 +123,7 @@ const modRoutes = {
   'POST /mod/reply': relay.reply,
   'POST /mod/progress': relay.progress,
   'POST /mod/suggestions': relay.suggestions,
+  'POST /mod/file': sendFileFromSession,
   'POST /mod/approval/request': relay.requestApproval,
   'POST /mod/approval/cancel': relay.cancelApproval,
   'POST /mod/forward': relay.setForward,
@@ -240,6 +276,11 @@ try {
       initialChatId,
       WebSocketImpl: MiniWebSocket,
       onText: (text, meta) => relay.handleIncoming(text, { reqId: meta.reqId }),
+      // 附件存盘后，把路径写进消息交给会话；会话用读文件工具查看（图片可直接看）。
+      onMedia: (files, meta) => {
+        const lines = files.map(f => `[${f.kind === 'image' ? '图片' : '文件'}] ${saveInbound(f)}`)
+        relay.handleIncoming([meta.text, ...lines].filter(Boolean).join('\n'), { reqId: meta.reqId })
+      },
       onUseSession: num => (relay.useSession(num).ok ? relay.list() : null),
       onAwaySession: num => {
         const r = relay.awaySession(num)
@@ -257,6 +298,8 @@ try {
     relay.onOutgoing(entry =>
       (entry.stream
         ? wecom.sendStream(entry.stream, entry.text, formatOutgoing(entry))
+        : entry.file
+        ? sendFileEntry(entry)
         : entry.approval
         ? wecom.sendApprovalCard(entry.approval, formatOutgoing(entry))
         : entry.sessions
@@ -272,6 +315,16 @@ try {
         err => console.error(`发往企微失败：${err.message}`),
       ),
     )
+    // 发送时才读文件：会话交来的路径已核对过，这时读不到说明文件刚被移走。
+    function sendFileEntry(entry) {
+      let buffer
+      try {
+        buffer = readFileSync(entry.file.path)
+      } catch (err) {
+        return wecom.send(`${formatOutgoing(entry)}\n（文件没发出去：读不到 ${entry.file.path}：${err.code ?? err.message}）`)
+      }
+      return wecom.sendFile({ buffer, filename: entry.file.name, kind: entry.file.kind }, formatOutgoing(entry))
+    }
     wecom.start()
     console.log(`企微：白名单 ${config.allowUsers.length} 人，正在连接`)
   }

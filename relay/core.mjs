@@ -166,6 +166,16 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     return { ok: true }
   }
 
+  // 会话要发一个本机文件到 IM。路径、大小、按图片还是文件发，由中转进程在调用前核对好。
+  function fileOut({ sessionId, path, name, kind, caption }) {
+    const s = sessions.get(sessionId)
+    if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
+    s.lastSeen = now()
+    const text = [String(caption ?? '').trim(), `[${kind === 'image' ? '图片' : '文件'}] ${name}`].filter(Boolean).join('\n')
+    pushLog({ dir: 'out', from: label(s), text, file: { path, name, kind } })
+    return { ok: true }
+  }
+
   // 企微发起的回合里每调用一个工具，会话插件报一行进度，IM 适配器刷新到那条消息的流式回复里。
   function progress({ sessionId, msgId, tool, summary }) {
     const s = sessions.get(sessionId)
@@ -713,6 +723,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     awaySession,
     suggestions,
     sendSuggestion,
+    fileOut,
     tell,
     setForward,
     hookPermission,

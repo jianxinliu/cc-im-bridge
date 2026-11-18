@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
+import { encryptLikeWecom } from './helpers/wecom-crypto.mjs'
 import { approvalCard, createWecomAdapter, questionCard, sessionsCard, suggestionsCard, extractText, formatOutgoing, loadWecomConfig, parseCardKey, splitByBytes } from '../relay/wecom.mjs'
 
 // 假 WebSocket：记录发出的帧，测试用 serverSays 模拟服务端下发。
@@ -147,13 +148,13 @@ test('白名单外用户：不进会话，回告其 userid', async () => {
   assert.match(reply.body.markdown.content, /你的 userid 是 mallory/)
 })
 
-test('非文字消息回告暂不支持', async () => {
+test('不支持的消息类型（如视频）回告可发的类型', async () => {
   const { socket, authOk, received } = setup()
   authOk()
-  socket().serverSays(textFrame('alice', '', { msgtype: 'image', image: { url: 'x' } }))
+  socket().serverSays(textFrame('alice', '', { msgtype: 'video', video: { url: 'x', aeskey: 'k' } }))
   await new Promise(r => setImmediate(r))
   assert.equal(received.length, 0)
-  assert.match(socket().lastSent().body.markdown.content, /暂只支持文字消息/)
+  assert.match(socket().lastSent().body.markdown.content, /暂不支持这种消息（video），可以发文字、图片或文件/)
 })
 
 test('发送：按 chatid 发 markdown，等回执后才发下一段', async () => {
@@ -691,4 +692,78 @@ test('建议卡片：正文列建议、按钮放编号；点了发送并更新�
   socket().serverSays(evt)
   assert.deepEqual(picks, [{ id: 4, n: 2 }])
   assert.equal(socket().lastSent().body.template_card.main_title.desc, '已发送：2. 提交')
+})
+
+const fakeFetch = (responses) => async url => {
+  const r = responses[url]
+  if (!r) return { ok: false, status: 404, headers: new Headers(), arrayBuffer: async () => new ArrayBuffer(0) }
+  return { ok: true, status: 200, headers: new Headers(r.headers ?? {}), arrayBuffer: async () => r.body }
+}
+
+test('收附件：下载并解密，连同文字和 req_id 交给中转；下载失败时告诉用户', async () => {
+  const key = Buffer.alloc(32, 7)
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3])
+  const got = []
+  const { socket, authOk } = setup({
+    onMedia: (files, meta) => got.push({ files, meta }),
+    fetchImpl: fakeFetch({ 'https://f/1': { body: encryptLikeWecom(png, key), headers: { 'content-disposition': 'attachment; filename="shot.png"' } } }),
+  })
+  authOk()
+  const frame = textFrame('alice', '', {
+    msgtype: 'mixed',
+    mixed: { msg_item: [{ msgtype: 'text', text: { content: '看看这个' } }, { msgtype: 'image', image: { url: 'https://f/1', aeskey: key.toString('base64') } }] },
+  })
+  socket().serverSays(frame)
+  for (let i = 0; i < 5 && !got.length; i++) await tick()
+  assert.equal(got.length, 1)
+  assert.equal(got[0].files[0].kind, 'image')
+  assert.equal(got[0].files[0].filename, 'shot.png')
+  assert.ok(got[0].files[0].buffer.equals(png))
+  assert.deepEqual(got[0].meta, { userId: 'alice', chatId: 'alice', reqId: frame.headers.req_id, text: '看看这个' })
+
+  socket().serverSays(textFrame('alice', '', { msgtype: 'file', file: { url: 'https://f/missing', aeskey: key.toString('base64') } }))
+  for (let i = 0; i < 5; i++) await tick()
+  assert.match(socket().lastSent().body.markdown.content, /附件没收到：下载附件失败：HTTP 404/)
+})
+
+test('发文件：init → 分片 → finish 拿 media_id，再按类型发出；按回执里的 upload_id 走', async () => {
+  const { socket, authOk, adapter } = setup()
+  authOk()
+  socket().serverSays(textFrame('alice', 'hi'))
+  const buffer = Buffer.alloc(600 * 1024, 1)
+  const sending = adapter.sendFile({ buffer, filename: 'big.bin', kind: 'file' }, '**[api]**\n[文件] big.bin')
+  const reply = body => socket().serverSays({ headers: { req_id: socket().lastSent().headers.req_id }, errcode: 0, body })
+  await tick()
+  const init = socket().lastSent()
+  assert.equal(init.cmd, 'aibot_upload_media_init')
+  assert.deepEqual([init.body.type, init.body.filename, init.body.total_size, init.body.total_chunks], ['file', 'big.bin', 600 * 1024, 2])
+  reply({ upload_id: 'up1' })
+  await tick()
+  for (const index of [0, 1]) {
+    const chunk = socket().lastSent()
+    assert.deepEqual([chunk.cmd, chunk.body.upload_id, chunk.body.chunk_index], ['aibot_upload_media_chunk', 'up1', index])
+    reply({})
+    await tick()
+  }
+  assert.equal(socket().lastSent().cmd, 'aibot_upload_media_finish')
+  reply({ media_id: 'mid9' })
+  await tick()
+  const msg = socket().lastSent()
+  assert.deepEqual([msg.cmd, msg.body.chatid, msg.body.msgtype, msg.body.file], ['aibot_send_msg', 'alice', 'file', { media_id: 'mid9' }])
+  reply({})
+  await sending
+})
+
+test('发文件失败（如上传初始化没给 upload_id）时改发文字并说明原因', async () => {
+  const { socket, authOk, adapter } = setup()
+  authOk()
+  socket().serverSays(textFrame('alice', 'hi'))
+  const sending = adapter.sendFile({ buffer: Buffer.from('x'), filename: 'a.txt', kind: 'file' }, '**[api]**\n[文件] a.txt')
+  await tick()
+  socket().serverSays({ headers: { req_id: socket().lastSent().headers.req_id }, errcode: 0, body: {} })
+  for (let i = 0; i < 3; i++) await tick()
+  const text = socket().lastSent().body.markdown.content
+  assert.match(text, /\[文件\] a\.txt\n（文件没发出去：上传初始化没有返回 upload_id/)
+  ackLast(socket())
+  await sending
 })

@@ -1,6 +1,9 @@
 // 企业微信智能机器人长连接适配器。
 // 协议依据：官方 SDK @wecom/aibot-node-sdk 1.0.7 的实现（帧格式、心跳 30 秒、回执超时 5 秒、
-// 新连接建立后服务端向旧连接发 disconnected_event 并断开）。用 Node 自带的 WebSocket，不引第三方依赖。
+// 新连接建立后服务端向旧连接发 disconnected_event 并断开）。WebSocket 由调用方注入（中转用 ws-client.mjs），不引第三方依赖。
+import { createHash } from 'node:crypto'
+
+import { decryptMedia, extractMedia, filenameFromDisposition, MAX_DOWNLOAD_BYTES } from './media.mjs'
 
 export const WECOM_WS_URL = 'wss://openws.work.weixin.qq.com'
 const HEARTBEAT_MS = 30_000
@@ -162,11 +165,19 @@ export function extractText(body) {
   return text
 }
 
+const UPLOAD_CHUNK_BYTES = 512 * 1024
+const MAX_UPLOAD_CHUNKS = 100
+const DOWNLOAD_TIMEOUT_MS = 60_000
+
 export function createWecomAdapter({
   botId,
   secret,
   allowUsers = [],
   onText,
+  // 收到图片或文件：(files: [{ kind, buffer, filename }], { text, userId, chatId, reqId }) => void。
+  onMedia = () => {},
+  // 下载附件用，测试时替换。
+  fetchImpl = globalThis.fetch,
   // 用户点了审批卡片的按钮：({ id, approve }) => 当前审批对象（含 status），用于把卡片更新成结论。
   onCardAction = () => null,
   // 用户点了会话卡片的按钮：(num) => 最新的会话列表（含 current），用于重画卡片；切换失败返回 null。
@@ -254,11 +265,17 @@ export function createWecomAdapter({
       chatId = replyTo
       onChatId(chatId)
     }
-    if (text === null) {
-      send(`暂只支持文字消息，收到的是 ${body.msgtype}`).catch(err => log.error(`企微：${err.message}`))
+    const media = extractMedia(body)
+    const meta = { userId, chatId: replyTo, reqId: frame.headers?.req_id }
+    if (media.length > 0) {
+      receiveMedia(media, { ...meta, text: text ?? '' })
       return
     }
-    if (text) onText(text, { userId, chatId: replyTo, reqId: frame.headers?.req_id })
+    if (text === null) {
+      send(`暂不支持这种消息（${body.msgtype}），可以发文字、图片或文件`).catch(err => log.error(`企微：${err.message}`))
+      return
+    }
+    if (text) onText(text, meta)
   }
 
   // 点审批卡片的按钮。要在 5 秒内用事件的 req_id 回 update_template_card，卡片才会变成结论。
@@ -374,6 +391,69 @@ export function createWecomAdapter({
     }).catch(err => log.warn(`企微：更新提问卡片 Q${id} 失败：${err.message}`))
   }
 
+  async function download({ url, aeskey }) {
+    const res = await fetchImpl(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) })
+    if (!res.ok) throw new Error(`下载附件失败：HTTP ${res.status}`)
+    const declared = Number(res.headers.get('content-length') ?? 0)
+    if (declared > MAX_DOWNLOAD_BYTES) throw new Error(`附件 ${(declared / 1024 / 1024).toFixed(1)}MB，超过 25MB 的上限`)
+    const encrypted = Buffer.from(await res.arrayBuffer())
+    if (encrypted.length > MAX_DOWNLOAD_BYTES) throw new Error('附件超过 25MB 的上限')
+    return { buffer: decryptMedia(encrypted, aeskey), filename: filenameFromDisposition(res.headers.get('content-disposition')) }
+  }
+
+  function receiveMedia(items, meta) {
+    Promise.all(items.map(async item => ({ kind: item.kind, ...(await download(item)) })))
+      .then(files => onMedia(files, meta))
+      .catch(err => {
+        log.warn(`企微：接收附件失败：${err.message}`)
+        send(`附件没收到：${err.message}`).catch(e => log.warn(`企微：${e.message}`))
+      })
+  }
+
+  // 三步分片上传（init → chunk × N → finish）拿到 media_id，再按图片或文件发出。
+  async function uploadMedia(buffer, filename, kind) {
+    const totalChunks = Math.max(1, Math.ceil(buffer.length / UPLOAD_CHUNK_BYTES))
+    if (totalChunks > MAX_UPLOAD_CHUNKS) throw new Error('文件太大，超过企微分片上传的上限')
+    const md5 = createHash('md5').update(buffer).digest('hex')
+    const init = await writeAndWait('aibot_upload_media_init', reqId('aibot_upload_media_init'), {
+      type: kind,
+      filename,
+      total_size: buffer.length,
+      total_chunks: totalChunks,
+      md5,
+    })
+    const uploadId = init?.body?.upload_id
+    if (!uploadId) throw new Error(`上传初始化没有返回 upload_id：errcode=${init?.errcode}`)
+    // 逐片顺序上传：企微后端对大量并发分片会报错，个人使用的文件不大，顺序上传足够。
+    for (let i = 0; i < totalChunks; i++) {
+      const chunk = buffer.subarray(i * UPLOAD_CHUNK_BYTES, (i + 1) * UPLOAD_CHUNK_BYTES)
+      await writeAndWait('aibot_upload_media_chunk', reqId('aibot_upload_media_chunk'), {
+        upload_id: uploadId,
+        chunk_index: i,
+        base64_data: chunk.toString('base64'),
+      })
+    }
+    const finish = await writeAndWait('aibot_upload_media_finish', reqId('aibot_upload_media_finish'), { upload_id: uploadId })
+    const mediaId = finish?.body?.media_id
+    if (!mediaId) throw new Error(`上传完成但没有返回 media_id：errcode=${finish?.errcode}`)
+    return mediaId
+  }
+
+  function sendFile({ buffer, filename, kind }, fallbackText) {
+    const run = sendChain.then(async () => {
+      if (!chatId) throw new Error('还不知道发给谁：先在企微里给机器人发一条消息')
+      try {
+        const mediaId = await uploadMedia(buffer, filename, kind)
+        await writeAndWait('aibot_send_msg', reqId('aibot_send_msg'), { chatid: chatId, msgtype: kind, [kind]: { media_id: mediaId } })
+      } catch (err) {
+        log.warn(`企微：发送${kind === 'image' ? '图片' : '文件'} ${filename} 失败：${err.message}`)
+        for (const chunk of splitByBytes(`${fallbackText}\n（文件没发出去：${err.message}）`)) await sendChunk(chatId, chunk)
+      }
+    })
+    sendChain = run.catch(() => {})
+    return run
+  }
+
   function handleFrame(frame) {
     if (frame.cmd === 'aibot_msg_callback') return handleCallback(frame)
     if (frame.cmd === 'aibot_event_callback') {
@@ -430,7 +510,7 @@ export function createWecomAdapter({
       timers.clearTimeout(pending.timer)
       if (frame.errcode && frame.errcode !== 0) {
         pending.reject(new Error(`企微拒绝发送 errcode=${frame.errcode} errmsg=${frame.errmsg}`))
-      } else pending.resolve()
+      } else pending.resolve(frame)
     }
   }
 
@@ -657,6 +737,7 @@ export function createWecomAdapter({
     sendQuestionCard,
     sendSuggestionsCard,
     sendStream,
+    sendFile,
     get isConnected() {
       return isAuthenticated
     },

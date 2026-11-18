@@ -64,7 +64,7 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.6.1' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.7.0' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
@@ -131,7 +131,7 @@ test('send 工具把文字发到 IM；空文字被拒绝', async ($, on) => {
   expect(calls.at(-1)).toEqual({ path: '/mod/reply', body: { sessionId: 'abcd1234-session', text: '部署完成' } })
 
   const empty = await $.tool.call({ tool: 'mcp__cc-im-bridge__send', text: '  ' })
-  expect(empty.deny).toBe('text 不能为空')
+  expect(empty.deny).toBe('text 和 file 至少给一个')
 })
 
 test('/im-name 校验名字并重新登记', async ($, on) => {
@@ -359,4 +359,22 @@ test('建议：收到 suggest 指令时 fork 本会话生成，结果交给中�
   await clock.advance(2000)
   await clock.settle()
   expect(calls.filter(c => c.path === '/mod/suggestions').at(-1)?.body.error).toContain('还没有可参考的上下文')
+})
+
+test('send 工具发文件：把路径和说明交给中转；中转拒绝时告诉模型原因', async ($, on) => {
+  let reject = false
+  const calls = fakeRelay(on, {
+    '/mod/poll': () => ({ ok: true, messages: [] }),
+    '/mod/file': () => (reject ? { status: 400, ok: false, error: '文件 25.0MB，超过企微 20MB 的上限' } : { ok: true }),
+  })
+  engineBeneath(on)
+  await startSession($)
+
+  const sent = await $.tool.call({ tool: 'mcp__cc-im-bridge__send', file: '/tmp/shot.png', text: '截图' })
+  expect(sent.result).toBe('已交给 IM 发送：/tmp/shot.png')
+  expect(calls.at(-1)).toEqual({ path: '/mod/file', body: { sessionId: 'abcd1234-session', path: '/tmp/shot.png', caption: '截图' } })
+
+  reject = true
+  const denied = await $.tool.call({ tool: 'mcp__cc-im-bridge__send', file: '/tmp/big.zip' })
+  expect(denied.deny).toBe('文件没发出：文件 25.0MB，超过企微 20MB 的上限')
 })

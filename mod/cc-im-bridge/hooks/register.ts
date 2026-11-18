@@ -1,7 +1,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
-const VERSION = '0.6.1'
+const VERSION = '0.7.0'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
 const MAX_NAME_CHARS = 32
@@ -186,11 +186,13 @@ async function start($: EngineInterface, cwd: string) {
   await $.tool.register({
     name: 'send',
     description:
-      '给用户的 IM（企业微信等）发一条消息。用于任务完成、出错或需要用户决定时主动通知；IM 发来的消息你正常回复即可，会自动发回，不必再调用本工具。',
+      '给用户的 IM（企业微信）发一条消息或一个本机文件。用于任务完成、出错、需要用户决定时主动通知，或把截图、报告等文件发到用户手机（PNG/JPG 不超过 10MB 按图片发，其他不超过 20MB 按文件发）。IM 发来的消息你正常回复即可，会自动发回，不必再调用本工具。用户从 IM 发来的图片和文件已存在本机，消息里会给出「[图片] 路径」「[文件] 路径」，直接读取即可。',
     inputSchema: {
       type: 'object',
-      properties: { text: { type: 'string', description: '消息内容，简洁' } },
-      required: ['text'],
+      properties: {
+        text: { type: 'string', description: '消息内容，简洁；发文件时作为说明，可省略' },
+        file: { type: 'string', description: '要发送的本机文件的绝对路径，可省略' },
+      },
     },
     isDeferred: false,
   })
@@ -221,9 +223,14 @@ async function reportProgress($: EngineInterface, tool: string, summary: string)
   }
 }
 
-async function sendFromTool($: EngineInterface, text: string) {
-  if (!text) return { deny: 'text 不能为空' }
+async function sendFromTool($: EngineInterface, text: string, file: string) {
+  if (!text && !file) return { deny: 'text 和 file 至少给一个' }
   try {
+    if (file) {
+      const r = await call($, '/mod/file', { sessionId: bridge.sessionId, path: file, caption: text })
+      if (!r.ok) return { deny: `文件没发出：${r.error ?? r.status}` }
+      return { result: `已交给 IM 发送：${file}` }
+    }
     await sendToIm($, text)
     return { result: '已发送到 IM' }
   } catch (err) {
@@ -374,7 +381,11 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: 'mcp__cc-im-bridge__send' }, ($, e) =>
-    sendFromTool($, String((e as { text?: unknown }).text ?? '').trim()),
+    sendFromTool(
+      $,
+      String((e as { text?: unknown }).text ?? '').trim(),
+      String((e as { file?: unknown }).file ?? '').trim(),
+    ),
   ).catch(() => ({ deny: `${PLUGIN}：发送失败，钩子出错` }))
 
   on('turn.start', async ($, e, next) => {

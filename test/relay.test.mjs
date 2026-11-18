@@ -138,3 +138,24 @@ test('审批长轮询：待批时挂起，IM 批准后立即返回', async () =>
   const pending = await request({ socket: true, path: '/mod/approval/wait', method: 'POST', body: { id: timedOut.body.id, timeoutMs: 100 } })
   assert.equal(pending.body.approval.state, 'pending')
 })
+
+test('会话发文件：核对绝对路径、文件存在、大小；合格的记入发往 IM 的消息', async () => {
+  const { writeFileSync } = await import('node:fs')
+  await request({ socket: true, path: '/mod/register', method: 'POST', body: { sessionId: 'sf', name: 'files', cwd: '' } })
+  const ok = join(home, 'shot.png')
+  writeFileSync(ok, Buffer.from([0x89, 0x50, 0x4e, 0x47]))
+  const cases = [
+    [{ path: 'relative.png' }, 400, /绝对路径/],
+    [{ path: join(home, 'nope.png') }, 400, /读不到文件/],
+    [{ path: home }, 400, /不是普通文件/],
+  ]
+  for (const [body, status, re] of cases) {
+    const r = await request({ socket: true, path: '/mod/file', method: 'POST', body: { sessionId: 'sf', ...body } })
+    assert.equal(r.status, status)
+    assert.match(r.body.error, re)
+  }
+  const r = await request({ socket: true, path: '/mod/file', method: 'POST', body: { sessionId: 'sf', path: ok, caption: '截图' } })
+  assert.equal(r.status, 200)
+  const { events } = (await request({ path: '/api/events?since=0', headers: { 'x-token': token() } })).body
+  assert.deepEqual([events.at(-1).from, events.at(-1).text], ['files', '截图\n[图片] shot.png'])
+})
