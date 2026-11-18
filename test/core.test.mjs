@@ -440,3 +440,62 @@ test('「离开」「回来了」对所有在线会话下发，离线会话不�
   assert.deepEqual(relay.poll({ sessionId: 'old' }).controls, [])
   assert.equal(relay.poll({ sessionId: 's1' }).messages.length, 0, '「离开」不会被当成普通消息发给会话')
 })
+
+const ask = [
+  { question: '框架？', header: '框架', multiSelect: false, options: [{ label: 'React' }, { label: 'Vue' }] },
+  { question: '功能？', header: '功能', multiSelect: true, options: [{ label: '登录' }, { label: '支付' }] },
+]
+
+test('提问：没开转发不建；开了按问题逐个发出，带结构化字段', () => {
+  const { relay } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  assert.deepEqual(relay.askQuestions({ sessionId: 's1', questions: ask }), { ok: true, forward: false })
+  relay.poll({ sessionId: 's1', forward: true })
+  const { id } = relay.askQuestions({ sessionId: 's1', questions: ask })
+  const cards = relay.since(0).filter(e => e.question).map(e => [e.question.index, e.question.total, e.question.question])
+  assert.deepEqual(cards, [[0, 2, '框架？'], [1, 2, '功能？']])
+  assert.equal(relay.getQuestion({ id }).question.state, 'pending')
+})
+
+test('提问作答：单选只能选一个、编号越界报错、多选按选项顺序拼接、全部答完才算回答', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.poll({ sessionId: 's1', forward: true })
+  const { id } = relay.askQuestions({ sessionId: 's1', questions: ask })
+  relay.handleIncoming('1 2')
+  assert.match(lastReply(), /这个问题只能选一个/)
+  relay.handleIncoming('5')
+  assert.match(lastReply(), /没有选项 5/)
+  relay.handleIncoming('vue')
+  assert.equal(relay.getQuestion({ id }).question.state, 'pending')
+  relay.handleIncoming('2，1')
+  assert.deepEqual(relay.getQuestion({ id }).question, { id, state: 'answered', answers: { '框架？': 'Vue', '功能？': '支付, 登录' } })
+  relay.handleIncoming('1')
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['1'], '答完后数字当普通消息')
+})
+
+test('提问：卡片点选作答；在电脑上答过或回合结束时作废', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.poll({ sessionId: 's1', forward: true })
+  const a = relay.askQuestions({ sessionId: 's1', questions: ask })
+  assert.equal(relay.pickQuestionOption({ id: a.id, index: 0, option: 1 }).answer, 'React')
+  assert.match(lastReply(), /Q\d+ 已回答：React（还有 1 个问题）/)
+  assert.equal(relay.pickQuestionOption({ id: a.id, index: 0, option: 2 }).ok, true, '同一题可改答')
+  relay.settleLocal({ sessionId: 's1', tool: 'Bash', summary: 'ls' })
+  assert.equal(relay.getQuestion({ id: a.id }).question.state, 'pending', '别的工具运行不影响提问')
+  relay.settleLocal({ sessionId: 's1', tool: 'AskUserQuestion', summary: 'x' })
+  assert.equal(relay.getQuestion({ id: a.id }).question.state, 'cancelled')
+  assert.match(lastReply(), /已在电脑上回答/)
+  assert.equal(relay.pickQuestionOption({ id: a.id, index: 1, option: 1 }).status, 409)
+})
+
+test('提问：同时有两个提问在等时，文字回复不猜', () => {
+  const { relay } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.poll({ sessionId: 's1', forward: true })
+  relay.askQuestions({ sessionId: 's1', questions: ask })
+  relay.askQuestions({ sessionId: 's1', questions: ask })
+  relay.handleIncoming('1')
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['1'])
+})

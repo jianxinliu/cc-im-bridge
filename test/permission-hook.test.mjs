@@ -128,11 +128,81 @@ test('一直没人答：轮询到上限后作废并交回本地', async () => {
   assert.match(events.at(-1).text, /已作废：10 分钟未答复/)
 })
 
-test('提问/批准计划、子代理里的调用：不转', async () => {
-  for (const extra of [{ tool_name: 'AskUserQuestion' }, { tool_name: 'ExitPlanMode' }, { agent_id: 'a1' }]) {
-    const r = await runHook(event('on', extra))
-    assert.deepEqual([r.code, r.stdout], [0, ''])
+test('子代理里的调用：不转', async () => {
+  const r = await runHook(event('on', { agent_id: 'a1' }))
+  assert.deepEqual([r.code, r.stdout], [0, ''])
+})
+
+const askEvent = sessionId =>
+  event(sessionId, {
+    tool_name: 'AskUserQuestion',
+    tool_input: {
+      questions: [
+        { question: '用哪个框架？', header: '框架', multiSelect: false, options: [{ label: 'React' }, { label: 'Vue' }] },
+        { question: '要哪些功能？', header: '功能', multiSelect: true, options: [{ label: '登录' }, { label: '支付' }, { label: '搜索' }] },
+      ],
+    },
+  })
+
+const lastText = async () => (await request({ path: '/api/events?since=0', method: 'GET' })).events.at(-1).text
+// 只看 since 之后的新事件，避免匹配到前一个测试留下的同类卡片。
+const lastSeq = async () => (await request({ path: '/api/events?since=0', method: 'GET' })).events.at(-1)?.seq ?? 0
+async function waitForEvent(re, since) {
+  for (let i = 0; i < 100; i++) {
+    const { events } = await request({ path: `/api/events?since=${since}`, method: 'GET' })
+    const hit = events.filter(e => re.test(e.text)).at(-1)
+    if (hit) return hit
+    await new Promise(r => setTimeout(r, 20))
   }
+  throw new Error(`等不到 ${re}`)
+}
+
+test('提问：企微里按编号回答两个问题（单选 + 多选）→ 带 answers 放行', async () => {
+  const since = await lastSeq()
+  const running = runHook(askEvent('on'))
+  const first = await waitForEvent(/提问 Q\d+（1\/2）/, since)
+  assert.ok(first.question, '带结构化字段供画卡片')
+  await request({ path: '/api/send', body: { text: '2' } })
+  assert.match(await lastText(), /已回答：Vue（还有 1 个问题）/)
+  await request({ path: '/api/send', body: { text: '1 3' } })
+  const r = await running
+  const out = JSON.parse(r.stdout).hookSpecificOutput.decision
+  assert.equal(out.behavior, 'allow')
+  assert.deepEqual(out.updatedInput.answers, { '用哪个框架？': 'Vue', '要哪些功能？': '登录, 搜索' })
+  assert.equal(out.updatedInput.questions.length, 2, '原问题原样带回')
+})
+
+test('提问：「答：」自填答案；在电脑上先答了则不输出', async () => {
+  let since = await lastSeq()
+  let running = runHook(askEvent('on'))
+  await waitForEvent(/提问 Q\d+（2\/2）/, since)
+  await request({ path: '/api/send', body: { text: 'React' } })
+  await request({ path: '/api/send', body: { text: '答：先只做登录' } })
+  let r = await running
+  assert.equal(JSON.parse(r.stdout).hookSpecificOutput.decision.updatedInput.answers['要哪些功能？'], '先只做登录')
+
+  since = await lastSeq()
+  running = runHook(askEvent('on'))
+  await waitForEvent(/提问 Q\d+（2\/2）/, since)
+  await request({ socket: true, path: '/mod/approval/settle-local', body: { sessionId: 'on', tool: 'AskUserQuestion', summary: 'x' } })
+  r = await running
+  assert.deepEqual([r.code, r.stdout], [0, ''])
+})
+
+test('提问：没开转发的会话不转', async () => {
+  const r = await runHook(askEvent('off'))
+  assert.deepEqual([r.code, r.stdout], [0, ''])
+})
+
+test('批准计划：卡片显示计划正文；批准后带回原输入放行', async () => {
+  const before = (await pendingIds()).length
+  const input = { plan: '## 计划\n1. 改接口\n2. 补测试', planFilePath: '/tmp/plan.md' }
+  const running = runHook(event('on', { tool_name: 'ExitPlanMode', tool_input: input }))
+  const id = await waitForApproval(before + 1)
+  assert.match(await lastText(), /请求批准 #\d+：批准计划\n## 计划\n1\. 改接口/)
+  await request({ path: '/api/send', body: { text: `/y ${id}` } })
+  const r = await running
+  assert.deepEqual(JSON.parse(r.stdout).hookSpecificOutput.decision, { behavior: 'allow', updatedInput: input })
 })
 
 test('中转没在跑、输入坏了：不输出，退出码 0', async () => {

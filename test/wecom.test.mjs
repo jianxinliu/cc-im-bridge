@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { approvalCard, createWecomAdapter, sessionsCard, extractText, formatOutgoing, loadWecomConfig, parseCardKey, splitByBytes } from '../relay/wecom.mjs'
+import { approvalCard, createWecomAdapter, questionCard, sessionsCard, extractText, formatOutgoing, loadWecomConfig, parseCardKey, splitByBytes } from '../relay/wecom.mjs'
 
 // 假 WebSocket：记录发出的帧，测试用 serverSays 模拟服务端下发。
 function fakeSocketFactory() {
@@ -329,7 +329,7 @@ test('审批卡片：带批准/拒绝按钮，标题写会话名与编号', () =
   assert.deepEqual(done.button_list.map(b => [b.text, b.key]), [['已拒绝', 'appr:3:done']])
   assert.equal(done.task_id, card.task_id, '更新时 task_id 不变')
 
-  assert.equal(approvalCard({ ...approval, summary: 'x'.repeat(500) }, 'p').sub_title_text.length, 401)
+  assert.equal(approvalCard({ ...approval, summary: 'x'.repeat(700) }, 'p').sub_title_text.length, 601)
 })
 
 test('parseCardKey 只认审批按钮', () => {
@@ -515,4 +515,48 @@ test('点会话按钮：旧卡片不生效；会话已不存在时提示重新�
   assert.deepEqual(picks, [])
   assert.match(socket().lastSent().body.markdown.content, /会话卡片已过期/)
   ackLast(socket())
+})
+
+const qcard = { id: 2, index: 0, total: 2, name: 'api', question: '用哪个框架？', header: '框架', multiSelect: false, options: [{ label: 'React', description: '组件库' }, { label: 'Vue', description: '' }] }
+
+test('提问卡片：单选每个选项一个编号按钮；多选改成文字回复；答完显示已回答', () => {
+  const card = questionCard(qcard, 'p')
+  assert.equal(card.card_type, 'button_interaction')
+  assert.deepEqual(card.main_title, { title: 'api 提问', desc: 'Q2 · 1/2 · 框架' })
+  assert.equal(card.sub_title_text, '用哪个框架？\n1. React — 组件库\n2. Vue\n点编号作答；也可回「答：其他内容」')
+  assert.deepEqual(card.button_list.map(b => [b.text, b.key]), [['1', 'q:2:0:1'], ['2', 'q:2:0:2']])
+  assert.equal(card.task_id, 'p_q2_0')
+
+  const multi = questionCard({ ...qcard, multiSelect: true }, 'p')
+  assert.equal(multi.card_type, 'text_notice')
+  assert.equal(multi.button_list, undefined)
+  assert.match(multi.sub_title_text, /可多选/)
+
+  const done = questionCard(qcard, 'p', 'React')
+  assert.match(done.sub_title_text, /已回答：React$/)
+  assert.deepEqual(done.button_list.map(b => b.key), ['q:2:0:done'])
+})
+
+test('点提问选项：交给中转作答，并用事件 req_id 把卡片更新成已回答；旧卡片不生效', async () => {
+  const picks = []
+  const { socket, authOk, adapter } = setup({ onQuestionPick: p => (picks.push(p), { ok: true, answer: 'Vue' }) })
+  authOk()
+  socket().serverSays(textFrame('alice', 'hi'))
+  const sending = adapter.sendQuestionCard(qcard, 'x')
+  await tick()
+  const taskId = socket().lastSent().body.template_card.task_id
+  ackLast(socket())
+  await sending
+
+  socket().serverSays(cardEvent('alice', 'q:2:0:9', {}, 'ccim_old_q2_0'))
+  await tick()
+  assert.deepEqual(picks, [])
+  ackLast(socket())
+
+  const evt = cardEvent('alice', 'q:2:0:2', {}, taskId)
+  socket().serverSays(evt)
+  assert.deepEqual(picks, [{ id: 2, index: 0, option: 2 }])
+  const update = socket().lastSent()
+  assert.equal(update.headers.req_id, evt.headers.req_id)
+  assert.match(update.body.template_card.sub_title_text, /已回答：Vue/)
 })

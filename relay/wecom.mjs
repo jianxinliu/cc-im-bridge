@@ -12,7 +12,7 @@ const MAX_AUTH_FAILURES = 5
 // 官方未写明 aibot_send_msg 的长度上限（被动回复是 20480 字节），按 cc-connect 的做法保守地切成 2000 字节一段。
 export const CHUNK_BYTES = 2000
 const DEDUP_SIZE = 500
-const CARD_SUMMARY_CHARS = 400
+const CARD_SUMMARY_CHARS = 600
 const CARD_KEY = /^appr:(\d+):(y|n)$/
 
 // 审批卡片：标题写会话名，按钮 key 带审批编号。task_id 每台机器人内不能重复，
@@ -46,6 +46,33 @@ export function parseCardKey(key) {
 
 const MAX_SESSION_BUTTONS = 6 // 企微按钮卡片最多 6 个按钮
 const SESSION_KEY = /^use:(\d+)$/
+const QUESTION_KEY = /^q:(\d+):(\d+):(\d+)$/
+
+// 提问卡片：单选且选项不超过 6 个时，每个选项一个编号按钮；多选或选项多时用文字回复编号。
+export function questionCard(card, taskPrefix, chosen) {
+  const options = card.options.map((o, i) => `${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ''}`)
+  const position = card.total > 1 ? ` · ${card.index + 1}/${card.total}` : ''
+  const canClick = !card.multiSelect && card.options.length > 0 && card.options.length <= MAX_SESSION_BUTTONS
+  const hint = chosen
+    ? `已回答：${chosen}`
+    : canClick
+      ? '点编号作答；也可回「答：其他内容」'
+      : `回复编号${card.multiSelect ? '，可多选，用空格分开（如 1 3）' : ''}；也可回「答：其他内容」`
+  const result = {
+    card_type: canClick ? 'button_interaction' : 'text_notice',
+    source: { desc: 'cc-im-bridge' },
+    main_title: { title: `${card.name} 提问`, desc: `Q${card.id}${position}${card.header ? ` · ${card.header}` : ''}` },
+    sub_title_text: [card.question, ...options, hint].join('\n').slice(0, 1000),
+    card_action: { type: 0 },
+    task_id: `${taskPrefix}_q${card.id}_${card.index}`,
+  }
+  if (canClick) {
+    result.button_list = chosen
+      ? [{ text: '已回答', style: 2, key: `q:${card.id}:${card.index}:done` }]
+      : card.options.map((_, i) => ({ text: String(i + 1), style: 2, key: `q:${card.id}:${card.index}:${i + 1}` }))
+  }
+  return result
+}
 
 // 会话列表卡片：每个会话一个按钮，当前会话标 ✓。
 export function sessionsCard(rows, taskId) {
@@ -114,6 +141,8 @@ export function createWecomAdapter({
   onCardAction = () => null,
   // 用户点了会话卡片的按钮：(num) => 最新的会话列表（含 current），用于重画卡片；切换失败返回 null。
   onUseSession = () => null,
+  // 用户点了提问卡片的选项：({ id, index, option }) => { ok, answer }。
+  onQuestionPick = () => ({ ok: false }),
   onChatId = () => {},
   initialChatId = '',
   log = console,
@@ -138,6 +167,7 @@ export function createWecomAdapter({
   let sendChain = Promise.resolve()
   const taskPrefix = `ccim_${Math.random().toString(36).slice(2, 10)}`
   const cards = new Map() // 审批编号 -> 发出时的卡片内容，用于点按钮后更新
+  const questionCards = new Map() // `${id}:${index}` -> 发出时的提问卡片内容
   let sessionCardSeq = 0
 
   const reqId = prefix => `${prefix}_${Date.now()}_${++seq}`
@@ -216,6 +246,9 @@ export function createWecomAdapter({
     const taskId = detail.task_id ?? body.event?.task_id
     const useMatch = SESSION_KEY.exec(eventKey ?? '')
     if (useMatch) return handleSessionPick(frame, Number(useMatch[1]), taskId)
+    if (/^q:\d+:\d+:done$/.test(eventKey ?? '')) return
+    const qMatch = QUESTION_KEY.exec(eventKey ?? '')
+    if (qMatch) return handleQuestionPick(frame, Number(qMatch[1]), Number(qMatch[2]), Number(qMatch[3]), taskId)
     const action = parseCardKey(eventKey)
     if (!action) {
       log.warn(`企微：卡片点击无法识别 event_key=${JSON.stringify(eventKey)} 内层字段=${Object.keys(detail).join(',')}`)
@@ -264,6 +297,25 @@ export function createWecomAdapter({
       const current = rows.find(r => r.current)
       send(`之后的消息发给 ${current?.name ?? num}`).catch(e => log.warn(`企微：${e.message}`))
     })
+  }
+
+  function handleQuestionPick(frame, id, index, option, taskId) {
+    const sent = questionCards.get(`${id}:${index}`)
+    // 只认本次启动发出的卡片：中转重启后提问编号会重新从 1 计。
+    if (!sent || taskId !== `${taskPrefix}_q${id}_${index}`) {
+      log.warn(`企微：忽略过期提问卡片的点击 task_id=${JSON.stringify(taskId)}`)
+      send('这张提问卡片已过期（中转重启过），不会生效').catch(err => log.warn(`企微：${err.message}`))
+      return
+    }
+    const r = onQuestionPick({ id, index, option })
+    if (!r.ok) {
+      send(r.error ?? `Q${id} 作答失败`).catch(err => log.warn(`企微：${err.message}`))
+      return
+    }
+    writeAndWait('aibot_respond_update_msg', frame.headers?.req_id, {
+      response_type: 'update_template_card',
+      template_card: questionCard(sent, taskPrefix, r.answer),
+    }).catch(err => log.warn(`企微：更新提问卡片 Q${id} 失败：${err.message}`))
   }
 
   function handleFrame(frame) {
@@ -405,6 +457,26 @@ export function createWecomAdapter({
 
   const send = text => sendTo(chatId, text)
 
+  function sendQuestionCard(card, fallbackText) {
+    const run = sendChain.then(async () => {
+      if (!chatId) throw new Error('还不知道发给谁：先在企微里给机器人发一条消息')
+      questionCards.set(`${card.id}:${card.index}`, card)
+      if (questionCards.size > DEDUP_SIZE) questionCards.delete(questionCards.keys().next().value)
+      try {
+        await writeAndWait('aibot_send_msg', reqId('aibot_send_msg'), {
+          chatid: chatId,
+          msgtype: 'template_card',
+          template_card: questionCard(card, taskPrefix),
+        })
+      } catch (err) {
+        log.warn(`企微：提问卡片 Q${card.id} 发送失败，改发文字：${err.message}`)
+        for (const chunk of splitByBytes(fallbackText)) await sendChunk(chatId, chunk)
+      }
+    })
+    sendChain = run.catch(() => {})
+    return run
+  }
+
   function sendSessionsCard(rows, fallbackText) {
     const run = sendChain.then(async () => {
       if (!chatId) throw new Error('还不知道发给谁：先在企微里给机器人发一条消息')
@@ -437,6 +509,7 @@ export function createWecomAdapter({
     send,
     sendApprovalCard,
     sendSessionsCard,
+    sendQuestionCard,
     get isConnected() {
       return isAuthenticated
     },

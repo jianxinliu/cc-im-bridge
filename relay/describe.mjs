@@ -14,6 +14,7 @@ const TOOL_LABELS = {
   Agent: '启动子代理',
   Task: '启动子代理',
   Skill: '使用技能',
+  ExitPlanMode: '批准计划',
 }
 
 const FIELD_LABELS = {
@@ -48,8 +49,15 @@ export function describeTool(tool) {
 const clip = (text, max) => (text.length > max ? `${text.slice(0, max)}…` : text)
 const oneLine = value => String(value).replace(/\s+/g, ' ').trim()
 
+const MAX_PLAN_CHARS = 380
+
 export function describeInput(tool, input) {
   if (input === null || typeof input !== 'object') return oneLine(input ?? '')
+  // 计划是 Markdown，保留换行；卡片放不下全文，截断后提示去电脑上看全文。
+  if (tool === 'ExitPlanMode' && typeof input.plan === 'string') {
+    const plan = input.plan.trim()
+    return plan.length > MAX_PLAN_CHARS ? `${plan.slice(0, MAX_PLAN_CHARS)}…\n（全文 ${plan.length} 字，见电脑上的计划文件）` : plan
+  }
   // 命令本身保留换行，最要紧，放第一行且给更长的长度。
   if (typeof input.command === 'string') {
     const lines = [clip(input.command.trim(), MAX_COMMAND_CHARS)]

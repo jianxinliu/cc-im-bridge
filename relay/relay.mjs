@@ -91,39 +91,54 @@ const modRoutes = {
   'POST /mod/forward': relay.setForward,
   'POST /mod/approval/settle-local': relay.settleLocal,
   'POST /hook/permission': relay.hookPermission,
+  'POST /hook/question': relay.askQuestions,
+  'POST /mod/question/cancel': relay.cancelQuestion,
 }
 
-// 长轮询：审批还在待批时最多挂 WAIT_MAX_MS，有结果立即返回；mod 那边循环调用。
+// 长轮询：审批或提问还在等时最多挂 WAIT_MAX_MS，有结果立即返回；调用方循环调用。
 const WAIT_MAX_MS = 25_000
-const approvalWaiters = new Map() // id -> Set<resolve>
-relay.onApprovalChange(a => {
-  for (const resolve of approvalWaiters.get(a.id) ?? []) resolve()
-  approvalWaiters.delete(a.id)
-})
 
-async function waitApproval({ id, timeoutMs }) {
-  const first = relay.getApproval({ id })
-  if (!first.ok || first.approval.state !== 'pending') return first
-  const wait = Math.min(Math.max(Number(timeoutMs) || WAIT_MAX_MS, 0), WAIT_MAX_MS)
-  await new Promise(resolve => {
-    const waiters = approvalWaiters.get(Number(id)) ?? new Set()
-    approvalWaiters.set(Number(id), waiters)
-    const done = () => {
-      clearTimeout(timer)
-      waiters.delete(done)
-      resolve()
-    }
-    const timer = setTimeout(done, wait)
-    waiters.add(done)
+function createWaiter(get, isPending, subscribe) {
+  const waiters = new Map() // id -> Set<resolve>
+  subscribe(item => {
+    for (const resolve of waiters.get(item.id) ?? []) resolve()
+    waiters.delete(item.id)
   })
-  return relay.getApproval({ id })
+  return async function wait({ id, timeoutMs }) {
+    const first = get({ id })
+    if (!first.ok || !isPending(first)) return first
+    const ms = Math.min(Math.max(Number(timeoutMs) || WAIT_MAX_MS, 0), WAIT_MAX_MS)
+    await new Promise(resolve => {
+      const set = waiters.get(Number(id)) ?? new Set()
+      waiters.set(Number(id), set)
+      const done = () => {
+        clearTimeout(timer)
+        set.delete(done)
+        resolve()
+      }
+      const timer = setTimeout(done, ms)
+      set.add(done)
+    })
+    return get({ id })
+  }
 }
+
+modRoutes['POST /mod/approval/wait'] = createWaiter(
+  relay.getApproval,
+  r => r.approval.state === 'pending',
+  relay.onApprovalChange,
+)
+modRoutes['POST /mod/question/wait'] = createWaiter(
+  relay.getQuestion,
+  r => r.question.state === 'pending',
+  relay.onQuestionChange,
+)
 
 const modServer = http.createServer(async (req, res) => {
   const route = `${req.method} ${req.url}`
   if (route === 'GET /mod/health') return send(res, 200, { ok: true })
   if (route === 'GET /mod/sessions') return send(res, 200, { ok: true, sessions: relay.list() })
-  const handler = route === 'POST /mod/approval/wait' ? waitApproval : modRoutes[route]
+  const handler = modRoutes[route]
   if (!handler) return send(res, 404, { ok: false, error: `没有这个接口：${route}` })
   try {
     answer(res, await handler(await readJson(req)))
@@ -224,6 +239,7 @@ try {
       WebSocketImpl: MiniWebSocket,
       onText: text => relay.handleIncoming(text),
       onUseSession: num => (relay.useSession(num).ok ? relay.list() : null),
+      onQuestionPick: pick => relay.pickQuestionOption(pick),
       onCardAction: ({ id, approve }) => {
         const r = relay.decideApproval({ id, approve })
         return r.approval ?? null
@@ -235,7 +251,9 @@ try {
         ? wecom.sendApprovalCard(entry.approval, formatOutgoing(entry))
         : entry.sessions
           ? wecom.sendSessionsCard(entry.sessions, formatOutgoing(entry))
-          : wecom.send(formatOutgoing(entry))
+          : entry.question
+            ? wecom.sendQuestionCard(entry.question, formatOutgoing(entry))
+            : wecom.send(formatOutgoing(entry))
       ).catch(
         err => console.error(`发往企微失败：${err.message}`),
       ),

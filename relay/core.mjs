@@ -33,6 +33,9 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
   const outgoingListeners = [] // IM 适配器：每条发往 IM 的消息都通知它们
   const approvals = new Map() // id -> { id, sessionId, name, tool, summary, status, reason, createdAt }
   const approvalListeners = [] // 审批状态变化时通知等待者
+  const questions = new Map() // id -> { id, sessionId, name, items, answers, status, createdAt }
+  const questionListeners = []
+  let questionSeq = 0
   let approvalSeq = 0
 
   const isOnline = s => now() - s.lastSeen <= ONLINE_WINDOW_MS
@@ -190,6 +193,8 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     const decision = text.match(/^\/(y|n)(?:\s+([\s\S]*))?$/)
     if (decision) return decideFromIm(decision[1] === 'y', decision[2] ?? '')
 
+    if (answerFromText(text)) return
+
     if (naturalDecision(text)) return
 
     if (STOP_PHRASES.has(text.toLowerCase())) {
@@ -329,8 +334,17 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
 
   // 工具已经开始运行（说明已在电脑上批准）或回合已结束时，作废这个会话还挂着的审批。
   // 给了 tool 和 summary 时只作废对得上的那条，避免并行的其他审批被误伤。
+  // 提问只有一种来源（AskUserQuestion），工具开始运行或回合结束都说明已在电脑上答过。
   function settleLocal({ sessionId, tool, summary }) {
     let count = 0
+    if (tool === undefined || tool === 'AskUserQuestion') {
+      for (const q of questions.values()) {
+        if (q.sessionId !== sessionId || q.status !== 'pending') continue
+        settleQuestion(q, 'cancelled')
+        tell(`提问 Q${q.id} 已在电脑上回答，无需再回复`)
+        count++
+      }
+    }
     for (const a of approvals.values()) {
       if (a.sessionId !== sessionId || a.status !== 'pending') continue
       if (tool !== undefined && (a.tool !== tool || a.summary !== summary)) continue
@@ -411,6 +425,129 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
 
   const onApprovalChange = listener => approvalListeners.push(listener)
 
+  // ---- 提问（AskUserQuestion）----
+  function settleQuestion(q, status) {
+    q.status = status
+    for (const listener of questionListeners) listener(q)
+  }
+
+  function pendingQuestions() {
+    for (const q of questions.values()) {
+      if (q.status === 'pending' && now() - q.createdAt > APPROVAL_TTL_MS) settleQuestion(q, 'expired')
+    }
+    return [...questions.values()].filter(q => q.status === 'pending')
+  }
+
+  // 一次提问最多 4 个问题；每个问题一张卡片，编号与卡片按钮一致。
+  function askQuestions({ sessionId, questions: items }) {
+    const s = sessions.get(sessionId)
+    if (!s || !isOnline(s) || !s.forward) return { ok: true, forward: false }
+    if (!Array.isArray(items) || items.length === 0) return { ok: false, status: 400, error: 'questions 不能为空' }
+    const q = {
+      id: ++questionSeq,
+      sessionId,
+      name: label(s),
+      items: items.map(it => ({
+        question: String(it.question ?? ''),
+        header: String(it.header ?? ''),
+        multiSelect: Boolean(it.multiSelect),
+        options: (it.options ?? []).map(o => ({ label: String(o.label ?? ''), description: String(o.description ?? '') })),
+      })),
+      answers: {},
+      status: 'pending',
+      createdAt: now(),
+    }
+    questions.set(q.id, q)
+    q.items.forEach((item, index) => {
+      const card = { id: q.id, index, total: q.items.length, name: q.name, ...item }
+      pushLog({ dir: 'out', from: q.name, text: questionText(card), question: card })
+    })
+    return { ok: true, forward: true, id: q.id }
+  }
+
+  function questionText(card) {
+    const head = `提问 Q${card.id}${card.total > 1 ? `（${card.index + 1}/${card.total}）` : ''}${card.header ? `：${card.header}` : ''}`
+    const options = card.options.map((o, i) => `${i + 1}. ${o.label}${o.description ? ` — ${o.description}` : ''}`)
+    const how = card.multiSelect ? '回复编号，可多选，用空格分开（如 1 3）' : '点编号或回复编号'
+    return [head, card.question, ...options, `${how}；也可回「答：其他内容」`].join('\n')
+  }
+
+  function getQuestion({ id }) {
+    pendingQuestions()
+    const q = questions.get(Number(id))
+    if (!q) return { ok: false, status: 404, error: `没有提问 Q${id}` }
+    return { ok: true, question: { id: q.id, state: q.status, answers: q.answers } }
+  }
+
+  function cancelQuestion({ id, why }) {
+    const q = questions.get(Number(id))
+    if (!q) return { ok: false, status: 404, error: `没有提问 Q${id}` }
+    if (q.status === 'pending') {
+      settleQuestion(q, 'cancelled')
+      tell(`提问 Q${q.id} 已作废${why ? `：${why}` : ''}`)
+    }
+    return { ok: true }
+  }
+
+  // 回答第 index 个问题。choice 是选项编号数组（从 1 起），或 { text } 自填答案。
+  function answerQuestion({ id, index, choice }) {
+    pendingQuestions()
+    const q = questions.get(Number(id))
+    if (!q) return { ok: false, status: 404, error: `没有提问 Q${id}` }
+    const item = q.items[index]
+    if (!item) return { ok: false, status: 400, error: `提问 Q${id} 没有第 ${index + 1} 个问题` }
+    if (q.status !== 'pending') return { ok: false, status: 409, question: q, error: `提问 Q${q.id} 已${q.status === 'answered' ? '回答' : '作废'}` }
+    let answer
+    if (Array.isArray(choice)) {
+      if (choice.length === 0) return { ok: false, status: 400, error: '没有选任何选项' }
+      if (!item.multiSelect && choice.length > 1) return { ok: false, status: 400, error: '这个问题只能选一个' }
+      const bad = choice.find(n => !item.options[n - 1])
+      if (bad !== undefined) return { ok: false, status: 400, error: `没有选项 ${bad}` }
+      answer = [...new Set(choice)].map(n => item.options[n - 1].label).join(', ')
+    } else {
+      answer = String(choice?.text ?? '').trim()
+      if (!answer) return { ok: false, status: 400, error: '答案为空' }
+    }
+    q.answers[item.question] = answer
+    const remaining = q.items.filter(it => !(it.question in q.answers)).length
+    if (remaining === 0) settleQuestion(q, 'answered')
+    return { ok: true, question: q, index, answer, remaining }
+  }
+
+  // 只有一个提问在等时，文字回复可以直接作答：编号、选项原文，或「答：内容」。
+  // 作答对象是它第一个还没回答的问题。
+  function answerFromText(text) {
+    const pending = pendingQuestions()
+    if (pending.length !== 1) return false
+    const q = pending[0]
+    const index = q.items.findIndex(it => !(it.question in q.answers))
+    const item = q.items[index]
+    const free = text.match(/^答[：:]\s*([\s\S]+)$/)
+    let choice
+    if (free) choice = { text: free[1] }
+    else if (/^\d+([\s,，、]+\d+)*$/.test(text)) choice = text.split(/[\s,，、]+/).map(Number)
+    else {
+      const n = item.options.findIndex(o => o.label.toLowerCase() === text.toLowerCase())
+      if (n === -1) return false
+      choice = [n + 1]
+    }
+    const r = answerQuestion({ id: q.id, index, choice })
+    tell(r.ok ? answeredText(r) : r.error)
+    return true
+  }
+
+  const answeredText = r =>
+    `Q${r.question.id} 已回答：${r.answer}${r.remaining > 0 ? `（还有 ${r.remaining} 个问题）` : ''}`
+
+  // 卡片按钮点选：回答并返回结果，供卡片更新。
+  function pickQuestionOption({ id, index, option }) {
+    const r = answerQuestion({ id, index, choice: [option] })
+    if (r.ok) tell(answeredText(r))
+    return r
+  }
+
+  const onQuestionChange = listener => questionListeners.push(listener)
+
   return {
     register,
     unregister,
@@ -430,5 +567,11 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     setForward,
     hookPermission,
     settleLocal,
+    askQuestions,
+    getQuestion,
+    cancelQuestion,
+    answerQuestion,
+    pickQuestionOption,
+    onQuestionChange,
   }
 }
