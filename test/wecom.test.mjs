@@ -329,7 +329,7 @@ test('审批卡片：带批准/拒绝按钮，标题写会话名与编号', () =
   assert.deepEqual(done.button_list.map(b => [b.text, b.key]), [['已拒绝', 'appr:3:done']])
   assert.equal(done.task_id, card.task_id, '更新时 task_id 不变')
 
-  assert.equal(approvalCard({ ...approval, summary: 'x'.repeat(500) }, 'p').sub_title_text.length, 301)
+  assert.equal(approvalCard({ ...approval, summary: 'x'.repeat(500) }, 'p').sub_title_text.length, 401)
 })
 
 test('parseCardKey 只认审批按钮', () => {

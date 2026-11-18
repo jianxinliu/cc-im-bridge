@@ -8,6 +8,7 @@
 - `relay/relay.mjs`：中转进程，Unix socket（给 mod 和钩子）+ 127.0.0.1 网页窗口 + 企微适配器的装配。
 - `relay/wecom.mjs`：企微智能机器人长连接适配器；`relay/ws-client.mjs`：自写 WebSocket 客户端。
 - `relay/titles.mjs`：从 `~/.claude/projects/*/<会话 id>.jsonl` 读最新的 `custom-title` 作为企微里的会话名（Desktop 侧边栏标题；每轮都会重写一次）。只读这一行，按修改时间缓存。
+- `relay/describe.mjs`：审批卡片上给人看的工具名与参数（只用于显示；匹配审批仍用 summary）。
 - `relay/summary.mjs`：审批摘要。**mod 的 `hooks/register.ts` 里有一份相同实现**，两边必须一致（mod 按摘要作废「已在电脑上处理」的审批），改一边要同步另一边。
 - `hooks/permission-request.mjs`：settings 的 PermissionRequest 钩子。
 - `mod/cc-im-bridge/`：会话插件（engine 的 hooks 模块）。用户级安装时直接读这个目录。
@@ -20,6 +21,7 @@
 
 ## 测试
 
+- 起中转子进程的测试，要在 `after()` 里把子进程全部杀掉：断言失败时子进程还活着，测试运行器会一直等（2026-11-18 犯过）。`npm test` 带了 `--test-timeout`。
 - `npm test` = node 测试 + `claude plugin test mod/cc-im-bridge`。提交前必须全过；写完新测试做一次变异（临时改坏被测条件，确认对应用例失败，再用反向 sed 还原）。
 - mod 的约束：`$` 只能传给文件顶层声明的函数（`claude plugin validate` 会拒）；模块内状态放在顶层 `bridge` 对象里。
 

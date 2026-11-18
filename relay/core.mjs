@@ -5,6 +5,8 @@ export const APPROVAL_TTL_MS = 15 * 60_000
 const MAX_QUEUE = 50
 const MAX_LOG = 500
 
+import { describeTool } from './describe.mjs'
+
 export const STATUS_TEXT = { pending: '待批', approved: '已批准', denied: '已拒绝', cancelled: '已作废', expired: '已超时' }
 // 只有一条待批时，单独回这些词当作批准或拒绝（去掉标点后整句精确匹配，避免把闲聊当成批准）。
 // 批准词只收明确的肯定；拒绝方向放宽一些，误判也只是不执行。
@@ -14,11 +16,17 @@ const LIST_PHRASES = new Set(['/list', '/ls', '会话', '会话列表', '有哪�
 const USE_PATTERN = /^(?:\/use|切到|切换到|换到)\s*(.+)$/
 
 // titleOf(sessionId)：会话在 Desktop 侧边栏上的标题（读不到返回 undefined），企微里优先用它显示和匹配。
-export function createRelay({ now = () => Date.now(), titleOf = () => undefined } = {}) {
+// initialTarget / onTargetChange：当前会话的持久化，让中转重启后不用重新选会话。
+export function createRelay({ now = () => Date.now(), titleOf = () => undefined, initialTarget = null, onTargetChange = () => {} } = {}) {
   const sessions = new Map() // sessionId -> { sessionId, name, cwd, lastSeen, queue: [] }
   const log = [] // 发往 IM 的消息与收到的 IM 消息，供 IM 适配器按序号拉取
   let seq = 0
-  let target = null // 当前默认投递的 sessionId
+  let target = initialTarget // 当前默认投递的 sessionId
+  function setTarget(sessionId) {
+    if (sessionId === target) return
+    target = sessionId
+    onTargetChange(target)
+  }
   const outgoingListeners = [] // IM 适配器：每条发往 IM 的消息都通知它们
   const approvals = new Map() // id -> { id, sessionId, name, tool, summary, status, reason, createdAt }
   const approvalListeners = [] // 审批状态变化时通知等待者
@@ -100,7 +108,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined 
     const s = sessions.get(sessionId)
     if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
     sessions.delete(sessionId)
-    if (target === sessionId) target = null
+    if (target === sessionId) setTarget(null)
     return { ok: true }
   }
 
@@ -144,7 +152,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined 
       return
     }
     s.queue.push({ id: `m${seq + 1}`, text, ts: now() })
-    target = s.sessionId
+    setTarget(s.sessionId)
     tell(isOnline(s) ? `→ ${label(s)}` : `→ ${label(s)}（会话离线，已排队，上线后投递）`)
   }
 
@@ -180,7 +188,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined 
 
     if (text === '/pending') {
       const pending = pendingApprovals()
-      return tell(pending.length === 0 ? '没有待批的请求' : pending.map(a => `#${a.id} ${a.name}：${a.tool} ${a.summary.split('\n')[0]}`).join('\n'))
+      return tell(pending.length === 0 ? '没有待批的请求' : pending.map(a => `#${a.id} ${a.name}：${a.toolLabel} ${a.detail.split('\n')[0]}`).join('\n'))
     }
 
     if (text === '/help') {
@@ -216,7 +224,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined 
   function useSession(ref) {
     const { session: s, error } = resolve(String(ref))
     if (!s) return { ok: false, error }
-    target = s.sessionId
+    setTarget(s.sessionId)
     return { ok: true, name: label(s), num: s.num }
   }
 
@@ -237,19 +245,31 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined 
     }
   }
 
-  function requestApproval({ sessionId, tool, summary }) {
+  // summary 用于匹配（与 mod 一致）；detail 是给人看的多行说明，没有就用 summary。
+  function requestApproval({ sessionId, tool, summary, detail }) {
     const s = sessions.get(sessionId)
     if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
     if (!tool) return { ok: false, status: 400, error: 'tool 必填' }
     expireOld()
-    const a = { id: ++approvalSeq, sessionId, name: label(s), tool, summary: summary ?? '', status: 'pending', reason: '', createdAt: now() }
+    const a = {
+      id: ++approvalSeq,
+      sessionId,
+      name: label(s),
+      tool,
+      toolLabel: describeTool(tool),
+      summary: summary ?? '',
+      detail: detail || summary || '',
+      status: 'pending',
+      reason: '',
+      createdAt: now(),
+    }
     approvals.set(a.id, a)
     pushLog({
       dir: 'out',
       from: a.name,
-      text: `请求批准 #${a.id}：${tool}\n${a.summary}\n回复「好」批准，「不行」拒绝`.replace(/\n\n/g, '\n'),
+      text: `请求批准 #${a.id}：${a.toolLabel}\n${a.detail}\n回复「好」批准，「不行」拒绝`.replace(/\n\n/g, '\n'),
       // IM 适配器据此画成带按钮的卡片；网页窗口仍显示 text。
-      approval: { id: a.id, name: a.name, tool, summary: a.summary },
+      approval: { id: a.id, name: a.name, tool: a.toolLabel, summary: a.detail },
     })
     return { ok: true, id: a.id }
   }
@@ -271,10 +291,10 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined 
 
   // settings 的 PermissionRequest 钩子来问：这个会话现在要不要把审批转到 IM。
   // 未登记、离线或没开转发的会话直接答「不转」，让本地照常弹框。
-  function hookPermission({ sessionId, tool, summary }) {
+  function hookPermission({ sessionId, tool, summary, detail }) {
     const s = sessions.get(sessionId)
     if (!s || !isOnline(s) || !s.forward) return { ok: true, forward: false }
-    return { ...requestApproval({ sessionId, tool, summary }), forward: true }
+    return { ...requestApproval({ sessionId, tool, summary, detail }), forward: true }
   }
 
   // 工具已经开始运行（说明已在电脑上批准）或回合已结束时，作废这个会话还挂着的审批。
@@ -318,7 +338,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined 
     return { ok: true, state: a.status, approval: a }
   }
 
-  const decidedText = a => `#${a.id} ${STATUS_TEXT[a.status]}（${a.name}：${a.tool}）`
+  const decidedText = a => `#${a.id} ${STATUS_TEXT[a.status]}（${a.name}：${a.toolLabel}）`
 
   // IM 里的 /y [编号]、/n [编号] [原因]，或「好」「不行，原因」；只有一条待批时可省略编号。
   function decideFromIm(isApprove, rest) {

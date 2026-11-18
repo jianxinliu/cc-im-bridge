@@ -8,6 +8,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+import { describeInput } from '../relay/describe.mjs'
 import { summarizeInput } from '../relay/summary.mjs'
 
 const SOCKET = join(process.env.CC_IM_HOME ?? join(homedir(), '.cc-im-bridge'), 'relay.sock')
@@ -54,7 +55,12 @@ const decision = d => JSON.stringify({ hookSpecificOutput: { hookEventName: 'Per
 export async function decide(event) {
   const { session_id: sessionId, tool_name: tool, tool_input: input, agent_id: agentId } = event
   if (!sessionId || !tool || PERSON_ONLY_TOOLS.has(tool) || agentId) return ''
-  const req = await call('/hook/permission', { sessionId, tool, summary: summarizeInput(input) })
+  const req = await call('/hook/permission', {
+    sessionId,
+    tool,
+    summary: summarizeInput(input),
+    detail: describeInput(tool, input),
+  })
   if (!req.ok || !req.forward || req.id === undefined) return ''
   const id = req.id
   for (let i = 0; i < MAX_POLLS; i++) {

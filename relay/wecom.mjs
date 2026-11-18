@@ -12,7 +12,7 @@ const MAX_AUTH_FAILURES = 5
 // 官方未写明 aibot_send_msg 的长度上限（被动回复是 20480 字节），按 cc-connect 的做法保守地切成 2000 字节一段。
 export const CHUNK_BYTES = 2000
 const DEDUP_SIZE = 500
-const CARD_SUMMARY_CHARS = 300
+const CARD_SUMMARY_CHARS = 400
 const CARD_KEY = /^appr:(\d+):(y|n)$/
 
 // 审批卡片：标题写会话名，按钮 key 带审批编号。task_id 每台机器人内不能重复，

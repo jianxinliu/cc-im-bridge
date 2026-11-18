@@ -147,7 +147,7 @@ test('审批：请求发到 IM，/y 编号 批准、/n 编号 原因 拒绝', ()
   const { relay, lastReply } = setup()
   relay.register({ sessionId: 's1', name: 'api', cwd: '' })
   const { id } = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'npm publish' })
-  assert.match(lastReply(), new RegExp(`请求批准 #${id}：Bash\\nnpm publish\\n回复「好」批准`))
+  assert.match(lastReply(), new RegExp(`请求批准 #${id}：执行命令\\nnpm publish\\n回复「好」批准`))
   relay.handleIncoming(`/y ${id}`)
   assert.deepEqual(relay.getApproval({ id }).approval, { id, state: 'approved', reason: '' })
   assert.match(lastReply(), /已批准/)
@@ -191,7 +191,7 @@ test('审批：超过 15 分钟未答自动超时；/pending 只列待批', () =
   const fresh = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'fresh\nsecond line' })
   assert.equal(relay.getApproval({ id: old.id }).approval.state, 'expired')
   relay.handleIncoming('/pending')
-  assert.equal(lastReply(), `#${fresh.id} api：Bash fresh`)
+  assert.equal(lastReply(), `#${fresh.id} api：执行命令 fresh`)
 })
 
 test('审批：未登记会话、缺 tool、不存在的编号返回错误', () => {
@@ -243,7 +243,12 @@ test('审批请求带结构化字段，供 IM 画卡片', () => {
   const { relay } = setup()
   relay.register({ sessionId: 's1', name: 'api', cwd: '' })
   const { id } = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'npm publish' })
-  assert.deepEqual(relay.since(0).at(-1).approval, { id, name: 'api', tool: 'Bash', summary: 'npm publish' })
+  assert.deepEqual(relay.since(0).at(-1).approval, { id, name: 'api', tool: '执行命令', summary: 'npm publish' })
+
+  const withDetail = relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'git push', detail: 'git push\n说明：推送' })
+  assert.equal(relay.since(0).at(-1).approval.summary, 'git push\n说明：推送', '卡片显示 detail')
+  relay.settleLocal({ sessionId: 's1', tool: 'Bash', summary: 'git push' })
+  assert.equal(relay.getApproval({ id: withDetail.id }).approval.state, 'cancelled', '匹配仍按原工具名与 summary')
 })
 
 test('口语答复：只有一条待批时「好」「可以！」批准，「不行，原因」拒绝并带原因', () => {
@@ -380,4 +385,28 @@ test('前缀同时命中多个标题时列出候选', () => {
   relay.register({ sessionId: 's2', name: 'b', cwd: '' })
   relay.handleIncoming('切到 tpa')
   assert.match(relay.since(0).at(-1).text, /tpa 能匹配多个会话：1\.tpa 发布验证、2\.tpa 判例整理/)
+})
+
+test('当前会话：切换时通知保存；用保存的值启动后，不带会话名的消息直接发给它', () => {
+  const saved = []
+  const first = createRelay({ onTargetChange: t => saved.push(t) })
+  first.register({ sessionId: 's1', name: 'api', cwd: '' })
+  first.register({ sessionId: 's2', name: 'web', cwd: '' })
+  first.handleIncoming('切到 web')
+  first.handleIncoming('切到 web')
+  assert.deepEqual(saved, ['s2'], '没变化时不重复保存')
+
+  const restarted = createRelay({ initialTarget: saved.at(-1) })
+  restarted.register({ sessionId: 's1', name: 'api', cwd: '' })
+  restarted.register({ sessionId: 's2', name: 'web', cwd: '' })
+  restarted.handleIncoming('接着说')
+  assert.deepEqual(restarted.poll({ sessionId: 's2' }).messages.map(m => m.text), ['接着说'])
+})
+
+test('当前会话注销后清空并通知保存', () => {
+  const saved = []
+  const relay = createRelay({ initialTarget: 's1', onTargetChange: t => saved.push(t) })
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.unregister({ sessionId: 's1' })
+  assert.deepEqual(saved, [null])
 })
