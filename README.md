@@ -50,7 +50,7 @@
 
 5. 在企微里给机器人发一条消息。不在白名单时机器人会回你的 userid，把它加进 `~/.cc-im-bridge/wecom.json` 的 `allowUsers`，再重启中转（`scripts/launchd.sh install` 会重启）。
 
-插件直接读仓库目录：改了 mod 代码后，在会话里执行 `/reload-plugins` 生效。改了中转代码后重新执行 `scripts/launchd.sh install`。
+改了 mod 代码后：升 `mod/cc-im-bridge/.claude-plugin/plugin.json` 的 version，执行 `claude plugin update cc-im-bridge@cc-im-bridge-local`，再在各会话执行 `/reload-plugins`。Claude Code 重启后加载的是安装时缓存的副本，只改仓库不升版本不会生效。改了中转代码后重新执行 `scripts/launchd.sh install`。
 
 ## 在企微里怎么用
 
