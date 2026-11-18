@@ -1,10 +1,12 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
-const VERSION = '0.5.1'
+const VERSION = '0.5.2'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
-const NAME_PATTERN = /^[\w.\-一-龥]{1,32}$/
+const MAX_NAME_CHARS = 32
+// 冒号用作「名字：内容」的分隔，不能出现在名字里。
+const NAME_FORBIDDEN = /[:：\p{Cc}]/u
 // 提交进会话的 IM 消息都带这个开头；回合开始时据此认出由 IM 发起的回合。
 const IM_MARKER = '[来自 IM 的消息'
 const IM_MESSAGE_ID = /^\[来自 IM 的消息 (m\d+)/
@@ -115,10 +117,15 @@ async function sendToIm($: EngineInterface, text: string, msgId?: string) {
   if (!r.ok) throw new Error(`发往 IM 失败：${r.error ?? r.status}`)
 }
 
-async function rename($: EngineInterface, wanted: string) {
-  if (!NAME_PATTERN.test(wanted)) {
-    return '名字为 1–32 个字母、数字、中文、点、下划线或短横线，例如 /im-name api'
-  }
+export function normalizeName(raw: string) {
+  const name = raw.replace(/\s+/g, ' ').trim()
+  if (!name || [...name].length > MAX_NAME_CHARS || NAME_FORBIDDEN.test(name)) return undefined
+  return name
+}
+
+async function rename($: EngineInterface, raw: string) {
+  const wanted = normalizeName(raw)
+  if (!wanted) return `名字为 1–${MAX_NAME_CHARS} 个字，可以有空格，不能含冒号，例如 /im-name 后端 API`
   const previous = bridge.name
   bridge.name = wanted
   try {

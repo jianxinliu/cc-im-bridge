@@ -50,7 +50,7 @@ export function parseCardKey(key) {
 }
 
 const MAX_SESSION_BUTTONS = 6 // 企微按钮卡片最多 6 个按钮
-const SESSION_KEY = /^use:(\d+)$/
+const SESSION_KEY = /^(use|away):(\d+)$/
 const QUESTION_KEY = /^q:(\d+):(\d+):(\d+)$/
 
 // 提问卡片：单选且选项不超过 6 个时，每个选项一个编号按钮；多选或选项多时用文字回复编号。
@@ -79,25 +79,33 @@ export function questionCard(card, taskPrefix, chosen) {
   return result
 }
 
-// 会话列表卡片：每个会话一个按钮，当前会话标 ✓。
-export function sessionsCard(rows, taskId) {
+// 会话列表卡片：每个会话一个按钮。mode 为 use 时选当前会话（标 ✓）；为 away 时选要遥控的会话（标遥控中的）。
+export function sessionsCard(rows, taskId, mode = 'use') {
   const shown = rows.slice(0, MAX_SESSION_BUTTONS)
   const extra = rows.length - shown.length
-  const current = rows.find(r => r.current)
+  const isAway = mode === 'away'
+  const marked = r => (isAway ? r.away : r.current)
+  const current = rows.find(marked)
+  const title = isAway ? '选择要遥控的会话' : '选择会话'
+  const desc = current
+    ? `${isAway ? '遥控中' : '当前'}：${current.num}. ${current.name}`
+    : isAway
+      ? '点编号，它的回复、审批、提问都发到这里'
+      : '点编号，之后的消息发给它'
   return {
     card_type: 'button_interaction',
     source: { desc: 'cc-im-bridge' },
-    main_title: { title: '选择会话', desc: current ? `当前：${current.num}. ${current.name}` : '点编号，之后的消息发给它' },
+    main_title: { title, desc },
     sub_title_text:
       rows.map(r => `${r.num}. ${r.name}${r.online ? '' : '（离线）'}${r.away ? '（遥控中）' : ''}`).join('\n') +
-      (extra > 0 ? `\n还有 ${extra} 个，说「切到 名字」` : ''),
+      (extra > 0 ? `\n还有 ${extra} 个，说「${isAway ? '离开' : '切到'} 名字」` : ''),
     card_action: { type: 0 },
     task_id: taskId,
     // 一行三个按钮时只显示得下三四个字符，名字会被截断；按钮只放编号，名字在上面的列表里。
     button_list: shown.map(r => ({
-      text: `${r.current ? '✓ ' : ''}${r.num}`,
-      style: r.current ? 1 : 2,
-      key: `use:${r.num}`,
+      text: `${marked(r) ? '✓ ' : ''}${r.num}`,
+      style: marked(r) ? 1 : 2,
+      key: `${mode}:${r.num}`,
     })),
   }
 }
@@ -146,6 +154,8 @@ export function createWecomAdapter({
   onCardAction = () => null,
   // 用户点了会话卡片的按钮：(num) => 最新的会话列表（含 current），用于重画卡片；切换失败返回 null。
   onUseSession = () => null,
+  // 用户点了遥控卡片的按钮：(num) => 最新的会话列表，用于重画卡片；失败返回 null。
+  onAwaySession = () => null,
   // 用户点了提问卡片的选项：({ id, index, option }) => { ok, answer }。
   onQuestionPick = () => ({ ok: false }),
   onChatId = () => {},
@@ -251,7 +261,7 @@ export function createWecomAdapter({
     if (/^appr:\d+:done$/.test(eventKey ?? '')) return
     const taskId = detail.task_id ?? body.event?.task_id
     const useMatch = SESSION_KEY.exec(eventKey ?? '')
-    if (useMatch) return handleSessionPick(frame, Number(useMatch[1]), taskId)
+    if (useMatch) return handleSessionPick(frame, useMatch[1], Number(useMatch[2]), taskId)
     if (/^q:\d+:\d+:done$/.test(eventKey ?? '')) return
     const qMatch = QUESTION_KEY.exec(eventKey ?? '')
     if (qMatch) return handleQuestionPick(frame, Number(qMatch[1]), Number(qMatch[2]), Number(qMatch[3]), taskId)
@@ -284,24 +294,25 @@ export function createWecomAdapter({
 
   // 点会话卡片的按钮：切到该会话，并把卡片重画成新的当前会话。
   // 编号在会话登记期间不变，但中转重启后会重排，所以同样只认本次启动发出的卡片。
-  function handleSessionPick(frame, num, taskId) {
+  function handleSessionPick(frame, mode, num, taskId) {
     if (!String(taskId ?? '').startsWith(`${taskPrefix}_s`)) {
       log.warn(`企微：忽略过期会话卡片的点击 task_id=${JSON.stringify(taskId)}`)
       send('这张会话卡片已过期（中转重启过），请重新发「会话」').catch(err => log.warn(`企微：${err.message}`))
       return
     }
-    const rows = onUseSession(num)
+    const rows = mode === 'away' ? onAwaySession(num) : onUseSession(num)
     if (!rows) {
       send(`会话 ${num} 已不存在，请重新发「会话」`).catch(err => log.warn(`企微：${err.message}`))
       return
     }
     writeAndWait('aibot_respond_update_msg', frame.headers?.req_id, {
       response_type: 'update_template_card',
-      template_card: sessionsCard(rows, taskId),
+      template_card: sessionsCard(rows, taskId, mode),
     }).catch(err => {
       log.warn(`企微：更新会话卡片失败：${err.message}`)
-      const current = rows.find(r => r.current)
-      send(`之后的消息发给 ${current?.name ?? num}`).catch(e => log.warn(`企微：${e.message}`))
+      const picked = rows.find(r => r.num === num)
+      const done = mode === 'away' ? `正在遥控 ${picked?.name ?? num}` : `之后的消息发给 ${picked?.name ?? num}`
+      send(done).catch(e => log.warn(`企微：${e.message}`))
     })
   }
 
@@ -552,14 +563,14 @@ export function createWecomAdapter({
     return streamFinal(stream, text, fallbackText)
   }
 
-  function sendSessionsCard(rows, fallbackText) {
+  function sendSessionsCard(rows, fallbackText, mode = 'use') {
     const run = sendChain.then(async () => {
       if (!chatId) throw new Error('还不知道发给谁：先在企微里给机器人发一条消息')
       try {
         await writeAndWait('aibot_send_msg', reqId('aibot_send_msg'), {
           chatid: chatId,
           msgtype: 'template_card',
-          template_card: sessionsCard(rows, `${taskPrefix}_s${++sessionCardSeq}`),
+          template_card: sessionsCard(rows, `${taskPrefix}_s${++sessionCardSeq}`, mode),
         })
       } catch (err) {
         log.warn(`企微：会话卡片发送失败，改发文字：${err.message}`)

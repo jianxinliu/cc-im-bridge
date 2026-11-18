@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, On } from 'claude-code/testing'
 
-import { defaultName } from '../hooks/register'
+import { defaultName, normalizeName } from '../hooks/register'
 
 type Call = { path: string; body: Record<string, unknown> }
 
@@ -62,7 +62,7 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.5.1' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.5.2' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
@@ -137,8 +137,11 @@ test('/im-name 校验名字并重新登记', async ($, on) => {
   engineBeneath(on)
   await startSession($)
 
-  const bad = await $.command.run({ command: 'im-name', args: 'a b' })
-  expect(bad.text).toContain('名字为')
+  const bad = await $.command.run({ command: 'im-name', args: 'api：v2' })
+  expect(bad.text).toContain('不能含冒号')
+
+  const spaced = await $.command.run({ command: 'im-name', args: '  后端   API  ' })
+  expect(spaced.text).toBe('本会话在 IM 里的名字改为 后端 API')
 
   const good = await $.command.run({ command: 'im-name', args: '后端' })
   expect(good.text).toBe('本会话在 IM 里的名字改为 后端')
@@ -315,4 +318,14 @@ test('取信时上报是否在离开模式，供企微会话列表标「遥控�
   await $.command.run({ command: 'im-away', args: 'on' })
   await clock.advance(2000)
   expect(calls.filter(c => c.path === '/mod/poll').at(-1)?.body.away).toBe(true)
+})
+
+test('名字规整：合并空格、去首尾空格；空、超长、含冒号或控制字符的不收', () => {
+  expect(normalizeName(' tpa  发布 验证 ')).toBe('tpa 发布 验证')
+  expect(normalizeName('😀 表情也行')).toBe('😀 表情也行')
+  expect(normalizeName('   ')).toBe(undefined)
+  expect(normalizeName('x'.repeat(33))).toBe(undefined)
+  expect(normalizeName('中'.repeat(32))).toBe('中'.repeat(32))
+  expect(normalizeName('a:b')).toBe(undefined)
+  expect(normalizeName('a\u0007b')).toBe(undefined)
 })

@@ -240,6 +240,11 @@ try {
       WebSocketImpl: MiniWebSocket,
       onText: (text, meta) => relay.handleIncoming(text, { reqId: meta.reqId }),
       onUseSession: num => (relay.useSession(num).ok ? relay.list() : null),
+      onAwaySession: num => {
+        const r = relay.awaySession(num)
+        if (r.ok) relay.tell(r.message)
+        return r.ok ? r.rows : null
+      },
       onQuestionPick: pick => relay.pickQuestionOption(pick),
       onCardAction: ({ id, approve }) => {
         const r = relay.decideApproval({ id, approve })
@@ -254,6 +259,8 @@ try {
         ? wecom.sendApprovalCard(entry.approval, formatOutgoing(entry))
         : entry.sessions
           ? wecom.sendSessionsCard(entry.sessions, formatOutgoing(entry))
+          : entry.awayPicker
+          ? wecom.sendSessionsCard(entry.awayPicker, formatOutgoing(entry), 'away')
           : entry.question
             ? wecom.sendQuestionCard(entry.question, formatOutgoing(entry))
             : wecom.send(formatOutgoing(entry))

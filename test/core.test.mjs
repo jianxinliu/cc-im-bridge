@@ -425,24 +425,35 @@ test('「停」给当前会话下发中断；没有当前会话时提示选择',
   assert.deepEqual(relay.poll({ sessionId: 's1' }).controls, [])
 })
 
-test('「离开」只对当前会话；「离开 编号/名字」指定会话并切过去；没选会话时提示', () => {
+test('「离开」：只有一个在线会话时直接遥控它；多个时回选择卡片', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.handleIncoming('离开')
+  assert.match(lastReply(), /^正在遥控 api/)
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).controls, [{ type: 'away', on: true }])
+
+  relay.register({ sessionId: 's2', name: 'web', cwd: '' })
+  relay.handleIncoming('离开')
+  const picker = relay.since(0).at(-1)
+  assert.deepEqual(picker.awayPicker.map(r => [r.num, r.name, r.away]), [[1, 'api', true], [2, 'web', false]])
+  assert.match(picker.text, /选择要遥控的会话/)
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).controls, [], '选之前不动任何会话')
+})
+
+test('遥控同一时间只有一个会话：「离开 2」切过去，原来的退出；也会成为当前会话', () => {
   const { relay, lastReply } = setup()
   relay.register({ sessionId: 's1', name: 'api', cwd: '' })
   relay.register({ sessionId: 's2', name: 'web', cwd: '' })
-  relay.handleIncoming('离开')
-  assert.match(lastReply(), /先选一个会话/)
-
-  relay.handleIncoming('切到 web')
-  relay.handleIncoming('离开')
-  assert.match(lastReply(), /已为 web 打开离开模式/)
-  assert.deepEqual(relay.poll({ sessionId: 's2' }).controls, [{ type: 'away', on: true }])
-  assert.deepEqual(relay.poll({ sessionId: 's1' }).controls, [], '别的会话不受影响')
-
-  relay.handleIncoming('离开 1')
-  assert.match(lastReply(), /已为 api 打开离开模式/)
+  relay.handleIncoming('离开 api')
   assert.deepEqual(relay.poll({ sessionId: 's1' }).controls, [{ type: 'away', on: true }])
+  relay.handleIncoming('离开 2')
+  assert.equal(lastReply(), '正在遥控 web：它每一轮的回复、审批、提问都发到这里（api 已退出遥控）。回到电脑说「回来了」')
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).controls, [{ type: 'away', on: false }])
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).controls, [{ type: 'away', on: true }])
+  relay.handleIncoming('离开 2')
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).controls, [], '已在遥控中不重复下发')
   relay.handleIncoming('继续')
-  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['继续'], '「离开 1」顺带切到 1')
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).messages.map(m => m.text), ['继续'])
   relay.handleIncoming('离开 nope')
   assert.match(lastReply(), /没有名为 nope 的会话/)
 })

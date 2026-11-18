@@ -21,7 +21,7 @@ const HELP_TEXT = [
   '切到 名字：之后发给它',
   '名字：内容：只发这一条',
   '停：中断当前这一轮',
-  '离开：当前会话进入遥控（离开 2：指定会话）',
+  '离开：选一个会话遥控（离开 2：直接指定）',
   '回来了：所有会话退出遥控',
   '好 / 不行，原因：批准或拒绝',
   '/pending：查看待批',
@@ -239,23 +239,26 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
       return tell(`已让 ${label(s)} 停下当前这一轮`)
     }
 
-    // 离开模式只开给一个会话：当前会话，或「离开 2」「离开 名字」指定的那个（并切过去）。
-    // 一次全开会让所有会话的回复都涌进来。
+    // 「离开 2」「离开 名字」：直接遥控指定会话。
     const awayTarget = text.match(AWAY_WITH_TARGET)
-    if (AWAY_PHRASES.has(text) || awayTarget) {
-      let s
-      if (awayTarget) {
-        const found = resolve(awayTarget[1])
-        if (!found.session) return tell(found.error)
-        s = found.session
-        setTarget(s.sessionId)
-      } else {
-        s = currentSession()
-        if (!s) return tell('先选一个会话：发「会话」点选，或说「离开 编号」')
-      }
-      s.controls.push({ type: 'away', on: true })
-      s.away = true
-      return tell(`已为 ${label(s)} 打开离开模式：它每一轮的回复、审批、提问都会发到这里。回到电脑说「回来了」`)
+    if (awayTarget) {
+      const r = awaySession(awayTarget[1])
+      return tell(r.ok ? r.message : r.error)
+    }
+
+    // 「离开」：只有一个在线会话就直接遥控它；多个时回一张卡片让你选。
+    if (AWAY_PHRASES.has(text)) {
+      const online = [...sessions.values()].filter(isOnline)
+      if (online.length === 0) return tell('没有在线的会话')
+      if (online.length === 1) return tell(awaySession(online[0].num).message)
+      const rows = list()
+      pushLog({
+        dir: 'out',
+        from: 'relay',
+        text: ['选择要遥控的会话（回「离开 编号」）：', ...rows.map(r => `${r.num}. ${r.name}${r.away ? '（遥控中）' : ''}`)].join('\n'),
+        awayPicker: rows,
+      })
+      return
     }
 
     // 回到电脑前：所有会话都恢复原样。
@@ -302,6 +305,30 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     if (chosen) return chosen
     const online = [...sessions.values()].filter(isOnline)
     return online.length === 1 ? online[0] : undefined
+  }
+
+  // 遥控一个会话：它进入离开模式并成为当前会话；同一时间只遥控一个，其他会话退出离开模式，
+  // 否则多个会话的回复会一起涌进 IM。
+  function awaySession(ref) {
+    const { session: s, error } = resolve(String(ref))
+    if (!s) return { ok: false, error }
+    const released = []
+    for (const other of sessions.values()) {
+      if (other === s || !other.away) continue
+      other.controls.push({ type: 'away', on: false })
+      other.away = false
+      released.push(label(other))
+    }
+    if (!s.away) s.controls.push({ type: 'away', on: true })
+    s.away = true
+    setTarget(s.sessionId)
+    const switched = released.length ? `（${released.join('、')} 已退出遥控）` : ''
+    return {
+      ok: true,
+      name: label(s),
+      rows: list(),
+      message: `正在遥控 ${label(s)}：它每一轮的回复、审批、提问都发到这里${switched}。回到电脑说「回来了」`,
+    }
   }
 
   // 切换之后不带会话名的消息发给谁。ref 可以是编号、名字或唯一前缀。
@@ -612,6 +639,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     onApprovalChange,
     decideApproval,
     useSession,
+    awaySession,
     tell,
     setForward,
     hookPermission,

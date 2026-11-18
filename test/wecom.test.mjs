@@ -644,3 +644,25 @@ test('流式：回复超过 20000 字节、或没有对应的流时，改发普�
   await tick()
   assert.equal(socket().lastSent().body.markdown?.content, '**[api]**\nx')
 })
+
+test('遥控卡片：按钮 key 为 away:编号，标出遥控中的会话；点了切过去并重画', async () => {
+  const card = sessionsCard(rows, 'p_s9', 'away')
+  assert.equal(card.main_title.title, '选择要遥控的会话')
+  assert.equal(card.main_title.desc, '遥控中：2. web-frontend-long-name')
+  assert.deepEqual(card.button_list.map(b => [b.text, b.key]), [['1', 'away:1'], ['✓ 2', 'away:2']])
+
+  const picks = []
+  const { socket, authOk, adapter } = setup({
+    onAwaySession: num => (picks.push(num), rows.map(r => ({ ...r, away: r.num === num }))),
+  })
+  authOk()
+  socket().serverSays(textFrame('alice', 'hi'))
+  const sending = adapter.sendSessionsCard(rows, 'x', 'away')
+  await tick()
+  const taskId = socket().lastSent().body.template_card.task_id
+  ackLast(socket())
+  await sending
+  socket().serverSays(cardEvent('alice', 'away:1', {}, taskId))
+  assert.deepEqual(picks, [1])
+  assert.equal(socket().lastSent().body.template_card.main_title.desc, '遥控中：1. api')
+})
