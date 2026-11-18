@@ -340,7 +340,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
   }
 
   // 在电脑上执行 /im-away on|off：通知 IM，并保持同一时间只遥控一个会话。
-  function awayFromSession({ sessionId, on }) {
+  function awayFromSession({ sessionId, on, reason }) {
     const s = sessions.get(sessionId)
     if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
     if (on) {
@@ -351,7 +351,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
       return { ok: true }
     }
     s.away = false
-    tell(`${label(s)} 已退出遥控（在电脑上关闭）`)
+    tell(`${label(s)} 已退出遥控（${reason === 'typed' ? '你在电脑上发了消息' : '在电脑上关闭'}）`)
     return { ok: true }
   }
 

@@ -625,3 +625,11 @@ test('在电脑上开离开模式：通知 IM、不给它自己再下发、让�
   assert.equal(relay.list().some(r => r.away), false)
   assert.equal(relay.awayFromSession({ sessionId: 'nope', on: true }).status, 404)
 })
+
+test('在电脑上发了消息而退出遥控时，通知里说明原因', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.awayFromSession({ sessionId: 's1', on: true })
+  relay.awayFromSession({ sessionId: 's1', on: false, reason: 'typed' })
+  assert.equal(lastReply(), 'api 已退出遥控（你在电脑上发了消息）')
+})

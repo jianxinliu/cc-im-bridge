@@ -1,7 +1,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
-const VERSION = '0.7.1'
+const VERSION = '0.7.2'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
 const MAX_NAME_CHARS = 32
@@ -275,7 +275,8 @@ async function settleLocal($: EngineInterface, body: { tool?: string; summary?: 
 }
 
 // source：local 为在电脑上执行 /im-away，要通知 IM；im 为 IM 里说的，中转已经回复过。
-async function setAway($: EngineInterface, wanted: string, source: 'local' | 'im' = 'local') {
+// reason：通知里说明为什么关的（typed：人在电脑上发了消息）。
+async function setAway($: EngineInterface, wanted: string, source: 'local' | 'im' = 'local', reason?: 'typed') {
   if (wanted !== 'on' && wanted !== 'off') {
     return `当前：${bridge.isAway ? 'on' : 'off'}。on：离开电脑，本会话的回复、审批、提问都发到 IM；off：只有 IM 发起的回合才发`
   }
@@ -285,7 +286,7 @@ async function setAway($: EngineInterface, wanted: string, source: 'local' | 'im
   await pushForward($)
   if (source === 'local' && changed && bridge.isRegistered) {
     try {
-      await call($, '/mod/away', { sessionId: bridge.sessionId, on: bridge.isAway })
+      await call($, '/mod/away', { sessionId: bridge.sessionId, on: bridge.isAway, ...(reason ? { reason } : {}) })
     } catch (err) {
       report($, `通知 IM 失败：${describe(err)}`)
     }
@@ -322,6 +323,12 @@ export function parseSuggestions(text: string) {
     .map(line => line.replace(/^\s*(?:[-*•·]|\d+[.、)）])\s*/, '').replace(/^["“]|["”]$/g, '').trim())
     .filter(Boolean)
     .slice(0, MAX_SUGGESTIONS)
+}
+
+// 人在 Desktop 输入框里发了普通消息，说明回到电脑前了，离开模式该自动关。
+// 斜杠命令（含 /im-away on 本身）、IM 转来的（plugin）、后台通知等都不算。
+export function isTypedAtComputer(originKind: string, isCommand: boolean) {
+  return originKind === 'composer' && !isCommand
 }
 
 async function suggestNext($: EngineInterface) {
@@ -396,6 +403,11 @@ export const register: Register = on => {
       String((e as { file?: unknown }).file ?? '').trim(),
     ),
   ).catch(() => ({ deny: `${PLUGIN}：发送失败，钩子出错` }))
+
+  on('prompt.submit', async ($, e, next) => {
+    if (bridge.isAway && isTypedAtComputer(e.origin.kind, Boolean(e.command))) await setAway($, 'off', 'local', 'typed')
+    return next(e)
+  })
 
   on('turn.start', async ($, e, next) => {
     if (!e.agentId) {

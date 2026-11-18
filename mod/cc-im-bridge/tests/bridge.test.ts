@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, On } from 'claude-code/testing'
 
-import { defaultName, normalizeName, parseSuggestions } from '../hooks/register'
+import { defaultName, isTypedAtComputer, normalizeName, parseSuggestions } from '../hooks/register'
 
 type Call = { path: string; body: Record<string, unknown> }
 
@@ -64,7 +64,7 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.7.1' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.7.2' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
@@ -392,4 +392,30 @@ test('在电脑上 /im-away 开关时通知中转；IM 里说「离开」触发�
   pending.push([{ type: 'away', on: true }])
   await clock.advance(2000)
   expect(calls.filter(c => c.path === '/mod/away').map(c => c.body.on)).toEqual([true, false])
+})
+
+test('只有在电脑输入框里发的普通消息才算回到电脑前', () => {
+  expect(isTypedAtComputer('composer', false)).toBe(true)
+  expect(isTypedAtComputer('composer', true)).toBe(false)
+  for (const kind of ['plugin', 'task-notification', 'bridge', 'sdk']) expect(isTypedAtComputer(kind, false)).toBe(false)
+})
+
+test('离开模式下，IM 转来的消息（插件提交）不会关闭离开模式', async ($, on) => {
+  let pending: { id: string; text: string }[] = []
+  const calls = fakeRelay(on, {
+    '/mod/poll': () => {
+      const messages = pending
+      pending = []
+      return { ok: true, messages }
+    },
+  })
+  const { submitted, clock } = engineBeneath(on)
+  await startSession($)
+  await clock.advance(2000)
+  await $.command.run({ command: 'im-away', args: 'on' })
+  pending = [{ id: 'm1', text: '继续' }]
+  await clock.advance(2000)
+  expect(submitted).toEqual(['[企微 m1] 继续'])
+  expect((await $.command.run({ command: 'im-status', args: '' })).text).toContain('离开模式：on')
+  expect(calls.filter(c => c.path === '/mod/away').map(c => c.body.on)).toEqual([true])
 })
