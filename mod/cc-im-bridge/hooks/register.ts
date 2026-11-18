@@ -1,12 +1,13 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
-const VERSION = '0.4.0'
+const VERSION = '0.5.0'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
 const NAME_PATTERN = /^[\w.\-一-龥]{1,32}$/
 // 提交进会话的 IM 消息都带这个开头；回合开始时据此认出由 IM 发起的回合。
 const IM_MARKER = '[来自 IM 的消息'
+const IM_MESSAGE_ID = /^\[来自 IM 的消息 (m\d+)/
 // 与仓库 relay/summary.mjs 一致：审批摘要，用来作废「已在电脑上处理」的那条审批。
 const MAX_SUMMARY_CHARS = 1000
 const SUMMARY_FIELDS = ['command', 'file_path', 'url', 'path', 'pattern']
@@ -16,7 +17,7 @@ type RelayAnswer = {
   status: number
   ok: boolean
   error?: string
-  messages?: { text: string }[]
+  messages?: { id: string; text: string }[]
   controls?: Control[]
 }
 type Control = { type: 'abort' } | { type: 'away'; on: boolean }
@@ -31,9 +32,11 @@ const bridge = {
   isRegistered: false,
   isPolling: false,
   problem: undefined as string | undefined,
-  // 由 IM 消息开启、还没结束的回合 id：这些回合的回复要发回 IM。
+  // 由 IM 消息开启、还没结束的回合：回合 id -> 那条 IM 消息的 id（回复按它接到那条消息的流式回复上）。
   // 按回合 id 认，而不是在取信时计数：取信时上一回合可能还没结束。
-  imTurnIds: new Set<string>(),
+  imTurns: new Map<string, string>(),
+  // 主循环当前回合对应的 IM 消息 id；不是 IM 发起的回合为空，此时不报进度。
+  currentMsgId: '',
   // 主循环当前回合是不是 IM 发起的：是的话人可能不在电脑前，审批要转到 IM。
   isImTurn: false,
   // 离开模式：人不在电脑前。本会话所有回合的回复、审批、提问都发到 IM。
@@ -95,7 +98,7 @@ async function tick($: EngineInterface) {
     for (const c of r.controls ?? []) await applyControl($, c)
     for (const m of r.messages ?? []) {
       await $.prompt.submit({
-        text: `${IM_MARKER}，本轮最终回复会自动发回 IM，请简洁]\n${m.text}`,
+        text: `${IM_MARKER} ${m.id}，本轮最终回复会自动发回 IM，请简洁]\n${m.text}`,
       })
     }
   } catch (err) {
@@ -106,9 +109,9 @@ async function tick($: EngineInterface) {
   }
 }
 
-async function sendToIm($: EngineInterface, text: string) {
+async function sendToIm($: EngineInterface, text: string, msgId?: string) {
   const body = text.length > MAX_REPLY_CHARS ? `${text.slice(0, MAX_REPLY_CHARS)}\n…（已截断）` : text
-  const r = await call($, '/mod/reply', { sessionId: bridge.sessionId, text: body })
+  const r = await call($, '/mod/reply', { sessionId: bridge.sessionId, text: body, ...(msgId ? { msgId } : {}) })
   if (!r.ok) throw new Error(`发往 IM 失败：${r.error ?? r.status}`)
 }
 
@@ -187,12 +190,24 @@ async function start($: EngineInterface, cwd: string) {
 }
 
 async function forwardAnswer($: EngineInterface, turnId: string, answer: string, isAborted: boolean) {
-  const fromIm = bridge.imTurnIds.delete(turnId)
+  const msgId = bridge.imTurns.get(turnId)
+  const fromIm = msgId !== undefined
+  bridge.imTurns.delete(turnId)
   // 离开模式下每一轮都发；否则按 /im-push。
   if (!bridge.isAway && (bridge.pushMode === 'off' || (bridge.pushMode === 'im' && !fromIm))) return
   const text = isAborted ? '（本轮被中断）' : answer.trim() || '（本轮没有文字回复）'
   try {
-    await sendToIm($, text)
+    await sendToIm($, text, msgId || undefined)
+  } catch (err) {
+    report($, describe(err))
+  }
+}
+
+// 报一行进度到 IM（只在 IM 发起的回合里）；失败不影响工具运行。
+async function reportProgress($: EngineInterface, tool: string, summary: string) {
+  if (!bridge.currentMsgId || !bridge.isRegistered) return
+  try {
+    await call($, '/mod/progress', { sessionId: bridge.sessionId, msgId: bridge.currentMsgId, tool, summary })
   } catch (err) {
     report($, describe(err))
   }
@@ -301,7 +316,10 @@ export const register: Register = on => {
     if (!e.agentId) {
       bridge.runningTurnId = e.turnId
       bridge.isImTurn = e.text.includes(IM_MARKER)
-      if (bridge.isImTurn) bridge.imTurnIds.add(e.turnId)
+      // 提示词开头形如「[来自 IM 的消息 m12，…」，m12 是那条 IM 消息的 id；旧格式没有 id 时记为空串。
+      const msgId = bridge.isImTurn ? (IM_MESSAGE_ID.exec(e.text)?.[1] ?? '') : ''
+      if (bridge.isImTurn) bridge.imTurns.set(e.turnId, msgId)
+      bridge.currentMsgId = msgId
       await pushForward($)
     }
     return next(e)
@@ -311,7 +329,10 @@ export const register: Register = on => {
     const done = await next(e)
     if (!e.agentId) {
       bridge.isImTurn = false
-      if (bridge.runningTurnId === e.turnId) bridge.runningTurnId = ''
+      if (bridge.runningTurnId === e.turnId) {
+        bridge.runningTurnId = ''
+        bridge.currentMsgId = ''
+      }
       await pushForward($)
       await settleLocal($, {})
       await forwardAnswer($, e.turnId, e.answer, e.isAborted)
@@ -323,7 +344,9 @@ export const register: Register = on => {
   on('tool.call', async ($, e, next) => {
     if (!e.agentId && e.tool !== 'mcp__cc-im-bridge__send') {
       const { tool, tool_use_id: _id, agentId: _agent, ...input } = e as unknown as Record<string, unknown>
-      void settleLocal($, { tool: String(tool), summary: summarize(input) })
+      const summary = summarize(input)
+      void settleLocal($, { tool: String(tool), summary })
+      void reportProgress($, String(tool), summary)
     }
     return next(e)
   })

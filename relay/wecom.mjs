@@ -12,6 +12,11 @@ const MAX_AUTH_FAILURES = 5
 // 官方未写明 aibot_send_msg 的长度上限（被动回复是 20480 字节），按 cc-connect 的做法保守地切成 2000 字节一段。
 export const CHUNK_BYTES = 2000
 const DEDUP_SIZE = 500
+// 流式回复：企微约 6 分钟后让流失效（846608），留些余量；刷新至少间隔几秒，免得刷屏和触发频率限制。
+const STREAM_TTL_MS = 5.5 * 60_000
+const STREAM_THROTTLE_MS = 2500
+const STREAM_MAX_BYTES = 20_000
+const PROGRESS_LINES = 8
 const CARD_SUMMARY_CHARS = 600
 const CARD_KEY = /^appr:(\d+):(y|n)$/
 
@@ -146,6 +151,7 @@ export function createWecomAdapter({
   onChatId = () => {},
   initialChatId = '',
   log = console,
+  now = Date.now,
   url = WECOM_WS_URL,
   WebSocketImpl = globalThis.WebSocket,
   timers = { setTimeout, clearTimeout, setInterval, clearInterval },
@@ -222,7 +228,7 @@ export function createWecomAdapter({
       send(`暂只支持文字消息，收到的是 ${body.msgtype}`).catch(err => log.error(`企微：${err.message}`))
       return
     }
-    if (text) onText(text, { userId, chatId: replyTo })
+    if (text) onText(text, { userId, chatId: replyTo, reqId: frame.headers?.req_id })
   }
 
   // 点审批卡片的按钮。要在 5 秒内用事件的 req_id 回 update_template_card，卡片才会变成结论。
@@ -477,6 +483,75 @@ export function createWecomAdapter({
     return run
   }
 
+  // ---- 流式回复：同一条消息里先显示「思考中」，再刷新进度，最后换成回复 ----
+  const streams = new Map() // key -> { reqId, streamId, startedAt, title, lines, chain, timer, isDead }
+
+  // 同一 req_id 的帧要串行发、逐个等回执（回执按 req_id 对应）。
+  function streamWrite(st, content, finish) {
+    const run = st.chain.then(() =>
+      writeAndWait('aibot_respond_msg', st.reqId, { msgtype: 'stream', stream: { id: st.streamId, finish, content } }),
+    )
+    st.chain = run.catch(() => {})
+    return run
+  }
+
+  const isExpired = st => now() - st.startedAt > STREAM_TTL_MS
+
+  function progressContent(st) {
+    const shown = st.lines.slice(-PROGRESS_LINES)
+    const skipped = st.lines.length - shown.length
+    return [`⏳ ${st.title} 处理中…`, ...(skipped > 0 ? [`…前面还有 ${skipped} 步`] : []), ...shown.map(l => `· ${l}`)].join('\n')
+  }
+
+  function streamStart({ key, reqId, title }, fallbackText) {
+    if (!reqId) return send(fallbackText)
+    const st = { reqId, streamId: `${taskPrefix}_st_${key}`, startedAt: now(), title, lines: [], chain: Promise.resolve(), timer: null, isDead: false }
+    streams.set(key, st)
+    if (streams.size > DEDUP_SIZE) streams.delete(streams.keys().next().value)
+    return streamWrite(st, `⏳ ${title} 思考中…`, false).catch(err => {
+      st.isDead = true
+      log.warn(`企微：流式回复开头发送失败，改发文字：${err.message}`)
+      return send(fallbackText)
+    })
+  }
+
+  // 进度只刷新流，不另发消息：流不可用时直接丢弃，最终回复照常发。
+  function streamProgress({ key }, line) {
+    const st = streams.get(key)
+    if (!st || st.isDead || isExpired(st)) return Promise.resolve()
+    st.lines.push(line)
+    if (!st.timer) {
+      st.timer = timers.setTimeout(() => {
+        st.timer = null
+        if (st.isDead || isExpired(st)) return
+        streamWrite(st, progressContent(st), false).catch(err => {
+          st.isDead = true
+          log.warn(`企微：流式进度刷新失败，之后只发最终回复：${err.message}`)
+        })
+      }, STREAM_THROTTLE_MS)
+    }
+    return Promise.resolve()
+  }
+
+  // 用最终回复结束流；流已失效、超时、过长或发送失败时，改发一条普通消息。
+  function streamFinal({ key }, text, fallbackText) {
+    const st = streams.get(key)
+    streams.delete(key)
+    if (st?.timer) timers.clearTimeout(st.timer)
+    const fits = new TextEncoder().encode(text).length <= STREAM_MAX_BYTES
+    if (!st || st.isDead || isExpired(st) || !fits) return send(fallbackText)
+    return streamWrite(st, text, true).catch(err => {
+      log.warn(`企微：流式回复收尾失败，改发文字：${err.message}`)
+      return send(fallbackText)
+    })
+  }
+
+  function sendStream(stream, text, fallbackText) {
+    if (stream.phase === 'start') return streamStart(stream, fallbackText)
+    if (stream.phase === 'progress') return streamProgress(stream, text)
+    return streamFinal(stream, text, fallbackText)
+  }
+
   function sendSessionsCard(rows, fallbackText) {
     const run = sendChain.then(async () => {
       if (!chatId) throw new Error('还不知道发给谁：先在企微里给机器人发一条消息')
@@ -510,6 +585,7 @@ export function createWecomAdapter({
     sendApprovalCard,
     sendSessionsCard,
     sendQuestionCard,
+    sendStream,
     get isConnected() {
       return isAuthenticated
     },

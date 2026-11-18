@@ -86,6 +86,7 @@ const modRoutes = {
   'POST /mod/unregister': relay.unregister,
   'POST /mod/poll': relay.poll,
   'POST /mod/reply': relay.reply,
+  'POST /mod/progress': relay.progress,
   'POST /mod/approval/request': relay.requestApproval,
   'POST /mod/approval/cancel': relay.cancelApproval,
   'POST /mod/forward': relay.setForward,
@@ -237,7 +238,7 @@ try {
       ...config,
       initialChatId,
       WebSocketImpl: MiniWebSocket,
-      onText: text => relay.handleIncoming(text),
+      onText: (text, meta) => relay.handleIncoming(text, { reqId: meta.reqId }),
       onUseSession: num => (relay.useSession(num).ok ? relay.list() : null),
       onQuestionPick: pick => relay.pickQuestionOption(pick),
       onCardAction: ({ id, approve }) => {
@@ -247,7 +248,9 @@ try {
       onChatId: chatId => writeFileSync(WECOM_STATE, JSON.stringify({ chatId }) + '\n', { mode: 0o600 }),
     })
     relay.onOutgoing(entry =>
-      (entry.approval
+      (entry.stream
+        ? wecom.sendStream(entry.stream, entry.text, formatOutgoing(entry))
+        : entry.approval
         ? wecom.sendApprovalCard(entry.approval, formatOutgoing(entry))
         : entry.sessions
           ? wecom.sendSessionsCard(entry.sessions, formatOutgoing(entry))

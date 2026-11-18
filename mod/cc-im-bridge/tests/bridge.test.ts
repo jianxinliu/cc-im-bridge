@@ -62,7 +62,7 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.4.0' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.5.0' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
@@ -274,4 +274,34 @@ test('IM 指令：「离开」打开离开模式；「停」中断正在跑的�
   pending.push([{ type: 'abort' }])
   await clock.advance(2000)
   expect(aborted).toEqual(['t9'])
+})
+
+test('流式进度：IM 消息带 id 提交；该回合每个工具报一行进度，回复带上 msgId；本地回合不报', async ($, on) => {
+  let pending = [{ id: 'm7', text: '跑测试' }]
+  const calls = fakeRelay(on, {
+    '/mod/poll': () => {
+      const messages = pending
+      pending = []
+      return { ok: true, messages }
+    },
+  })
+  on('tool.call', () => ({ result: {} }))
+  const { submitted, clock } = engineBeneath(on)
+  await startSession($)
+  await clock.advance(2000)
+  expect(submitted[0]?.startsWith('[来自 IM 的消息 m7，')).toBe(true)
+
+  await $.turn.start({ text: submitted[0] ?? '', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command: 'npm test' })
+  await clock.settle()
+  expect(calls.filter(c => c.path === '/mod/progress').map(c => c.body)).toEqual([
+    { sessionId: 'abcd1234-session', msgId: 'm7', tool: 'Bash', summary: 'npm test' },
+  ])
+  await $.turn.complete({ answer: '全部通过', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  expect(calls.filter(c => c.path === '/mod/reply').at(-1)?.body).toEqual({ sessionId: 'abcd1234-session', text: '全部通过', msgId: 'm7' })
+
+  await $.turn.start({ text: '本地提问', turnId: 't2' })
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  await clock.settle()
+  expect(calls.filter(c => c.path === '/mod/progress').length).toBe(1)
 })

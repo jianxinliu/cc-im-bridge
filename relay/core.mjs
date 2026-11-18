@@ -7,6 +7,8 @@ const MAX_LOG = 500
 
 import { describeTool } from './describe.mjs'
 
+const PROGRESS_CHARS = 60
+
 export const STATUS_TEXT = { pending: '待批', approved: '已批准', denied: '已拒绝', cancelled: '已作废', expired: '已超时' }
 // 只有一条待批时，单独回这些词当作批准或拒绝（去掉标点后整句精确匹配，避免把闲聊当成批准）。
 // 批准词只收明确的肯定；拒绝方向放宽一些，误判也只是不执行。
@@ -36,6 +38,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
   const questions = new Map() // id -> { id, sessionId, name, items, answers, status, createdAt }
   const questionListeners = []
   let questionSeq = 0
+  let messageSeq = 0
   let approvalSeq = 0
 
   const isOnline = s => now() - s.lastSeen <= ONLINE_WINDOW_MS
@@ -131,12 +134,24 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     return { ok: true, messages, controls }
   }
 
-  function reply({ sessionId, text }) {
+  // msgId：这条回复对应的企微消息（会话插件从提示词里认出）。带上时 IM 适配器把它作为那条消息的流式回复收尾。
+  function reply({ sessionId, text, msgId }) {
     const s = sessions.get(sessionId)
     if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
     if (!text?.trim()) return { ok: false, status: 400, error: 'text 为空' }
     s.lastSeen = now()
-    pushLog({ dir: 'out', from: label(s), text })
+    pushLog({ dir: 'out', from: label(s), text, ...(msgId ? { stream: { key: msgId, phase: 'final' } } : {}) })
+    return { ok: true }
+  }
+
+  // 企微发起的回合里每调用一个工具，会话插件报一行进度，IM 适配器刷新到那条消息的流式回复里。
+  function progress({ sessionId, msgId, tool, summary }) {
+    const s = sessions.get(sessionId)
+    if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
+    if (!msgId || !tool) return { ok: false, status: 400, error: 'msgId 和 tool 必填' }
+    const brief = String(summary ?? '').replace(/\s+/g, ' ').trim()
+    const line = `${describeTool(tool)}${brief ? `：${brief.length > PROGRESS_CHARS ? `${brief.slice(0, PROGRESS_CHARS)}…` : brief}` : ''}`
+    pushLog({ dir: 'out', from: label(s), text: line, stream: { key: msgId, phase: 'progress' } })
     return { ok: true }
   }
 
@@ -155,18 +170,22 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     }))
   }
 
-  function deliver(s, text) {
+  // meta.reqId：企微这条消息的回调 req_id；有它时回执改为流式回复的开头，之后的进度与最终回复都刷新在同一条里。
+  function deliver(s, text, meta = {}) {
     if (s.queue.length >= MAX_QUEUE) {
       tell(`${label(s)} 的待投递消息已满 ${MAX_QUEUE} 条，本条未投递`)
       return
     }
-    s.queue.push({ id: `m${seq + 1}`, text, ts: now() })
+    const id = `m${++messageSeq}`
+    s.queue.push({ id, text, ts: now() })
     setTarget(s.sessionId)
-    tell(isOnline(s) ? `→ ${label(s)}` : `→ ${label(s)}（会话离线，已排队，上线后投递）`)
+    const receipt = isOnline(s) ? `→ ${label(s)}` : `→ ${label(s)}（会话离线，已排队，上线后投递）`
+    if (meta.reqId) pushLog({ dir: 'out', from: 'relay', text: receipt, stream: { key: id, reqId: meta.reqId, phase: 'start', title: label(s) } })
+    else tell(receipt)
   }
 
-  // IM 侧发来的一条消息：命令、@指定会话，或发给当前会话。
-  function handleIncoming(raw) {
+  // IM 侧发来的一条消息：命令、@指定会话，或发给当前会话。meta 见 deliver。
+  function handleIncoming(raw, meta = {}) {
     const text = String(raw ?? '').trim()
     if (!text) return
     pushLog({ dir: 'in', from: 'me', text })
@@ -230,7 +249,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     if (at) {
       const { session: s, error } = resolve(at[1])
       if (!s) return tell(error)
-      return deliver(s, at[2])
+      return deliver(s, at[2], meta)
     }
 
     // 「api：跑一下测试」：冒号前是某个会话的完整名字或编号时，发给它；
@@ -239,12 +258,12 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     if (named) {
       const key = named[1].trim().toLowerCase()
       const s = [...sessions.values()].find(x => namesOf(x).includes(key) || String(x.num) === key)
-      if (s) return deliver(s, named[2])
+      if (s) return deliver(s, named[2], meta)
     }
 
     const s = currentSession()
     if (!s) return tell('不确定发给哪个会话：发「会话」点选一个，或说「切到 名字」')
-    deliver(s, text)
+    deliver(s, text, meta)
   }
 
   // 不带会话名的消息发给谁：选过的会话；没选过且只有一个在线时就是它。
@@ -567,6 +586,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     setForward,
     hookPermission,
     settleLocal,
+    progress,
     askQuestions,
     getQuestion,
     cancelQuestion,

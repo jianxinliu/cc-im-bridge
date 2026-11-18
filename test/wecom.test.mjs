@@ -119,8 +119,9 @@ test('连上后发送订阅帧，带 bot_id 和 secret', () => {
 test('白名单用户的文字消息交给中转，并记住 chatid', () => {
   const { socket, authOk, received, chatIds, adapter } = setup()
   authOk()
-  socket().serverSays(textFrame('alice', ' @api 跑测试 '))
-  assert.deepEqual(received, [{ text: '@api 跑测试', userId: 'alice', chatId: 'alice' }])
+  const frame = textFrame('alice', ' @api 跑测试 ')
+  socket().serverSays(frame)
+  assert.deepEqual(received, [{ text: '@api 跑测试', userId: 'alice', chatId: 'alice', reqId: frame.headers.req_id }])
   assert.deepEqual(chatIds, ['alice'])
   assert.equal(adapter.chatId, 'alice')
 })
@@ -559,4 +560,87 @@ test('点提问选项：交给中转作答，并用事件 req_id 把卡片更新
   const update = socket().lastSent()
   assert.equal(update.headers.req_id, evt.headers.req_id)
   assert.match(update.body.template_card.sub_title_text, /已回答：Vue/)
+})
+
+function streamSetup(extra = {}) {
+  let clock = 0
+  const ctx = setup({ now: () => clock, ...extra })
+  ctx.authOk()
+  ctx.socket().serverSays(textFrame('alice', 'hi'))
+  return { ...ctx, advanceClock: ms => (clock += ms) }
+}
+const streamFrames = s => s.sent.filter(f => f.cmd === 'aibot_respond_msg')
+
+test('流式：开头「思考中」，进度节流刷新，结尾换成回复；帧都用消息的 req_id、同一个 stream id', async () => {
+  const { socket, adapter, timers } = streamSetup()
+  adapter.sendStream({ key: 'm1', reqId: 'cb_1', phase: 'start', title: 'api' }, '', '→ api')
+  await tick()
+  ackLast(socket())
+  for (const line of ['执行命令：npm test', '读取文件：a.ts']) adapter.sendStream({ key: 'm1', phase: 'progress' }, line, '')
+  await tick()
+  assert.equal(streamFrames(socket()).length, 1, '节流期内不刷新')
+  timers.advance(2500)
+  await tick()
+  ackLast(socket())
+  const done = adapter.sendStream({ key: 'm1', phase: 'final' }, '全部通过', '**[api]**\n全部通过')
+  await tick()
+  ackLast(socket())
+  await done
+
+  const frames = streamFrames(socket())
+  assert.deepEqual(frames.map(f => f.headers.req_id), ['cb_1', 'cb_1', 'cb_1'])
+  assert.equal(new Set(frames.map(f => f.body.stream.id)).size, 1)
+  assert.deepEqual(frames.map(f => [f.body.stream.content, f.body.stream.finish]), [
+    ['⏳ api 思考中…', false],
+    ['⏳ api 处理中…\n· 执行命令：npm test\n· 读取文件：a.ts', false],
+    ['全部通过', true],
+  ])
+})
+
+test('流式：超过约 6 分钟或开头发送失败时，最终回复改发普通消息；进度不另发', async () => {
+  const { socket, adapter, advanceClock } = streamSetup()
+  adapter.sendStream({ key: 'm2', reqId: 'cb_2', phase: 'start', title: 'api' }, '', '→ api')
+  await tick()
+  ackLast(socket())
+  advanceClock(6 * 60_000)
+  const before = socket().sent.length
+  adapter.sendStream({ key: 'm2', phase: 'progress' }, '执行命令：ls', '')
+  await tick()
+  assert.equal(socket().sent.length, before, '流过期后进度直接丢弃')
+  const done = adapter.sendStream({ key: 'm2', phase: 'final' }, '好了', '**[api]**\n好了')
+  await tick()
+  const last = socket().lastSent()
+  assert.deepEqual([last.cmd, last.body.markdown?.content], ['aibot_send_msg', '**[api]**\n好了'])
+  ackLast(socket())
+  await done
+
+  adapter.sendStream({ key: 'm3', reqId: 'cb_3', phase: 'start', title: 'api' }, '', '→ api')
+  await tick()
+  socket().serverSays({ headers: { req_id: 'cb_3' }, errcode: 846605, errmsg: 'invalid req_id' })
+  await tick()
+  await tick()
+  assert.deepEqual([socket().lastSent().cmd, socket().lastSent().body.markdown?.content], ['aibot_send_msg', '→ api'])
+})
+
+test('流式：回复超过 20000 字节、或没有对应的流时，改发普通消息', async () => {
+  const { socket, adapter } = streamSetup()
+  adapter.sendStream({ key: 'm4', reqId: 'cb_4', phase: 'start', title: 'api' }, '', '→ api')
+  await tick()
+  ackLast(socket())
+  const long = '中'.repeat(7000)
+  const sendingLong = adapter.sendStream({ key: 'm4', phase: 'final' }, long, `**[api]**\n${long}`)
+  await tick()
+  assert.equal(socket().lastSent().cmd, 'aibot_send_msg', '超长回复不走流')
+  // 超长回复拆成多段，逐段回执直到发完。
+  let settled = false
+  sendingLong.then(() => (settled = true))
+  for (let i = 0; i < 20 && !settled; i++) {
+    ackLast(socket())
+    await tick()
+  }
+  assert.equal(settled, true)
+
+  adapter.sendStream({ key: 'nope', phase: 'final' }, 'x', '**[api]**\nx')
+  await tick()
+  assert.equal(socket().lastSent().body.markdown?.content, '**[api]**\nx')
 })

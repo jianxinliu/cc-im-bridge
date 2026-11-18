@@ -499,3 +499,27 @@ test('提问：同时有两个提问在等时，文字回复不猜', () => {
   relay.handleIncoming('1')
   assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['1'])
 })
+
+test('流式：带 reqId 的企微消息用流开头代替回执；进度与带 msgId 的回复接在同一条流上', () => {
+  const { relay } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.handleIncoming('跑测试', { reqId: 'cb_1' })
+  const start = relay.since(0).at(-1)
+  assert.deepEqual(start.stream, { key: 'm1', reqId: 'cb_1', phase: 'start', title: 'api' })
+  const [msg] = relay.poll({ sessionId: 's1' }).messages
+  assert.equal(msg.id, 'm1')
+
+  relay.progress({ sessionId: 's1', msgId: 'm1', tool: 'Bash', summary: 'npm   test\n--watch' })
+  assert.deepEqual([relay.since(0).at(-1).text, relay.since(0).at(-1).stream], ['执行命令：npm test --watch', { key: 'm1', phase: 'progress' }])
+  relay.progress({ sessionId: 's1', msgId: 'm1', tool: 'Read', summary: 'x'.repeat(80) })
+  assert.equal(relay.since(0).at(-1).text, `读取文件：${'x'.repeat(60)}…`)
+
+  relay.reply({ sessionId: 's1', text: '全部通过', msgId: 'm1' })
+  assert.deepEqual(relay.since(0).at(-1).stream, { key: 'm1', phase: 'final' })
+  relay.reply({ sessionId: 's1', text: '不带 msgId 的普通回复' })
+  assert.equal(relay.since(0).at(-1).stream, undefined)
+
+  relay.handleIncoming('网页发的，没有 reqId')
+  assert.equal(relay.since(0).at(-1).stream, undefined)
+  assert.equal(relay.progress({ sessionId: 's1', tool: 'Bash' }).status, 400)
+})
