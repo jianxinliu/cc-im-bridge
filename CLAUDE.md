@@ -18,7 +18,7 @@
 
 - 中转由 launchd 托管（`com.cc-im-bridge.relay`），日志 `~/.cc-im-bridge/relay.log`。改了中转代码后执行 `scripts/launchd.sh install` 重启；不要再在会话里另起一个中转，同一机器人两个连接会互踢（服务端发 `disconnected_event`，本中转收到后不再重连）。
 - 数据目录 `~/.cc-im-bridge/`：`wecom.json` 含 secret，只取键名查看，不要打印值。
-- 改了 mod 后：**先把 `plugin.json` 的 version 升一级，再 `claude plugin update cc-im-bridge@cc-im-bridge-local`，然后各会话 `/reload-plugins`**。安装时 Claude Code 在 `~/.claude/plugins/cache/cc-im-bridge-local/cc-im-bridge/<版本>/` 存了一份副本：Desktop 重启后各会话加载的是这份副本，不再读仓库目录（2026-11-18 实测：重启后 8 个会话全回到 0.2.1，`/reload-plugins` 也只重载副本）。不升版本号，`plugin update` 不会更新副本。核对办法：`curl --unix-socket ~/.cc-im-bridge/relay.sock http://relay/mod/sessions` 看各会话上报的 version。
+- 改了 mod 后：**先把 `plugin.json` 的 version 升一级，再 `claude plugin update cc-im-bridge@cc-im-bridge-local`，然后重启 Claude Desktop（⌘Q 再打开）**。安装时 Claude Code 在 `~/.claude/plugins/cache/cc-im-bridge-local/cc-im-bridge/<版本>/` 存了一份副本：Desktop 重启后各会话加载的是这份副本，不再读仓库目录（2026-11-18 实测：重启后 8 个会话全回到 0.2.1；`plugin update` 之后，已在运行的会话执行 `/reload-plugins` 仍是旧版，只有更新后才启动的会话进程用上了新版。`plugin update` 的输出也写着「Restart to apply changes」）。不升版本号，`plugin update` 不会更新副本。核对办法：`curl --unix-socket ~/.cc-im-bridge/relay.sock http://relay/mod/sessions` 看各会话上报的 version。
 
 ## 测试
 

@@ -37,8 +37,20 @@ const BACK_PHRASES = new Set(['回来了', '我回来了', '回来', '关闭离�
 const USE_PATTERN = /^(?:\/use|切到|切换到|换到)\s*(.+)$/
 
 // titleOf(sessionId)：会话在 Desktop 侧边栏上的标题（读不到返回 undefined），企微里优先用它显示和匹配。
+const NUMBER_KEEP_MS = 14 * 24 * 3600_000
+const MAX_KEPT_NUMBERS = 30
+
 // initialTarget / onTargetChange：当前会话的持久化，让中转重启后不用重新选会话。
-export function createRelay({ now = () => Date.now(), titleOf = () => undefined, initialTarget = null, onTargetChange = () => {} } = {}) {
+// initialNumbers / onNumbersChange：会话编号的持久化（会话 id -> { num, seenAt }），
+// 让同一个会话一直用同一个编号，不随中转重启、登记先后而变。
+export function createRelay({
+  now = () => Date.now(),
+  titleOf = () => undefined,
+  initialTarget = null,
+  onTargetChange = () => {},
+  initialNumbers = {},
+  onNumbersChange = () => {},
+} = {}) {
   const sessions = new Map() // sessionId -> { sessionId, name, cwd, lastSeen, queue: [] }
   const log = [] // 发往 IM 的消息与收到的 IM 消息，供 IM 适配器按序号拉取
   let seq = 0
@@ -73,9 +85,28 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
   }
   const namesOf = s => [label(s), s.name].map(n => n.toLowerCase())
 
-  // 每个会话一个在登记期间不变的小编号，IM 里可以用 @2、/use 2 指代。
+  // 记过的编号：离线、注销的会话也保留它的编号，回来时还用原来的；14 天没出现的才让出来。
+  const numbers = new Map(
+    Object.entries(initialNumbers ?? {}).filter(([, v]) => Number.isInteger(v?.num) && now() - (v.seenAt ?? 0) <= NUMBER_KEEP_MS),
+  )
+
+  function rememberNumber(sessionId, num) {
+    const before = numbers.get(sessionId)?.num
+    numbers.set(sessionId, { num, seenAt: now() })
+    // 记太多时，先让出最久没出现、且不在线的。
+    if (numbers.size > MAX_KEPT_NUMBERS) {
+      const removable = [...numbers.entries()]
+        .filter(([id]) => !sessions.has(id))
+        .sort((a, b) => a[1].seenAt - b[1].seenAt)
+      for (const [id] of removable.slice(0, numbers.size - MAX_KEPT_NUMBERS)) numbers.delete(id)
+    }
+    if (before !== num) onNumbersChange(Object.fromEntries(numbers))
+  }
+
+  // 新会话取最小的空闲编号：在线会话和记着的编号都不占用。
   function freeNumber() {
     const used = new Set([...sessions.values()].map(s => s.num))
+    for (const v of numbers.values()) used.add(v.num)
     let n = 1
     while (used.has(n)) n++
     return n
@@ -115,13 +146,17 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     }
     let inherited
     if (holder && holder.sessionId !== sessionId) {
+      // 同名的离线会话被新会话接替（例如同一目录开了新会话），编号也一并接过来。
       inherited = holder.num
       sessions.delete(holder.sessionId)
+      numbers.delete(holder.sessionId)
     }
     const existing = sessions.get(sessionId)
+    const num = existing?.num ?? numbers.get(sessionId)?.num ?? inherited ?? freeNumber()
+    if (!existing) rememberNumber(sessionId, num)
     sessions.set(sessionId, {
       sessionId,
-      num: existing?.num ?? inherited ?? freeNumber(),
+      num,
       name,
       cwd: cwd ?? '',
       version: version ?? '',

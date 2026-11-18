@@ -22,23 +22,27 @@ const MAX_BODY = 1 << 20
 const PAGE = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'web.html'), 'utf8')
 
 const readTitle = createTitleReader()
-// 记住当前会话：中转重启后会话会带着同一个 id 重新登记，不用在企微里重新选。
+// 记住当前会话和各会话的编号：中转重启后会话会带着同一个 id 重新登记，不用重选、编号不变。
 const RELAY_STATE = join(HOME, 'relay-state.json')
-let initialTarget = null
+const state = { target: null, numbers: {} }
 try {
-  initialTarget = JSON.parse(readFileSync(RELAY_STATE, 'utf8')).target ?? null
+  Object.assign(state, JSON.parse(readFileSync(RELAY_STATE, 'utf8')))
 } catch (err) {
   if (err.code !== 'ENOENT') console.warn(`读取 ${RELAY_STATE} 失败，忽略：${err.message}`)
 }
+function saveState(patch) {
+  Object.assign(state, patch)
+  try {
+    writeFileSync(RELAY_STATE, JSON.stringify(state) + '\n', { mode: 0o600 })
+  } catch (err) {
+    console.warn(`保存 ${RELAY_STATE} 失败，中转重启后当前会话和编号可能变化：${err.message}`)
+  }
+}
 const relay = createRelay({
-  initialTarget,
-  onTargetChange: target => {
-    try {
-      writeFileSync(RELAY_STATE, JSON.stringify({ target }) + '\n', { mode: 0o600 })
-    } catch (err) {
-      console.warn(`保存当前会话失败，重启后需重新选择：${err.message}`)
-    }
-  },
+  initialTarget: state.target ?? null,
+  onTargetChange: target => saveState({ target }),
+  initialNumbers: state.numbers ?? {},
+  onNumbersChange: numbers => saveState({ numbers }),
   titleOf: sessionId => {
     try {
       return readTitle(sessionId)

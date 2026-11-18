@@ -135,7 +135,7 @@ test('@编号、@唯一前缀、/use 编号都能定位会话；前缀有歧义�
   assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['默认会话'])
 })
 
-test('编号在会话登记期间不变；注销后空出的编号给新会话复用', () => {
+test('编号固定：会话改名不变；注销后编号仍留给它，新会话不占；它回来时还用原编号', () => {
   const { relay } = setup()
   relay.register({ sessionId: 's1', name: 'a', cwd: '' })
   relay.register({ sessionId: 's2', name: 'b', cwd: '' })
@@ -143,7 +143,31 @@ test('编号在会话登记期间不变；注销后空出的编号给新会话�
   assert.deepEqual(relay.list().map(r => [r.num, r.name]), [[1, 'a2'], [2, 'b']])
   relay.unregister({ sessionId: 's1' })
   relay.register({ sessionId: 's3', name: 'c', cwd: '' })
-  assert.deepEqual(relay.list().map(r => [r.num, r.name]), [[1, 'c'], [2, 'b']])
+  relay.register({ sessionId: 's1', name: 'a2', cwd: '' })
+  assert.deepEqual(relay.list().map(r => [r.num, r.name]), [[1, 'a2'], [2, 'b'], [3, 'c']])
+})
+
+test('编号固定：中转重启后按保存的编号还原，与重新登记的先后无关', () => {
+  let saved = {}
+  const first = createRelay({ onNumbersChange: n => (saved = n) })
+  for (const [id, name] of [['s1', 'api'], ['s2', 'web'], ['s3', 'pm']]) first.register({ sessionId: id, name, cwd: '' })
+
+  const restarted = createRelay({ initialNumbers: JSON.parse(JSON.stringify(saved)) })
+  for (const [id, name] of [['s3', 'pm'], ['s2', 'web'], ['s4', 'new'], ['s1', 'api']]) restarted.register({ sessionId: id, name, cwd: '' })
+  assert.deepEqual(restarted.list().map(r => [r.num, r.name]), [[1, 'api'], [2, 'web'], [3, 'pm'], [4, 'new']])
+})
+
+test('编号固定：14 天没出现的编号让出来；同名新会话接替离线旧会话时接过它的编号', () => {
+  let t = 1_000_000
+  const old = { num: 1, seenAt: t - 15 * 24 * 3600_000 }
+  const relay = createRelay({ now: () => t, initialNumbers: { gone: old, kept: { num: 2, seenAt: t } } })
+  relay.register({ sessionId: 'new', name: 'x', cwd: '' })
+  assert.equal(relay.list()[0].num, 1, '过期的编号 1 让给新会话；编号 2 仍保留')
+
+  relay.register({ sessionId: 'kept', name: 'proj', cwd: '' })
+  t += 60_000
+  relay.register({ sessionId: 'kept-2', name: 'proj', cwd: '' })
+  assert.deepEqual(relay.list().map(r => [r.num, r.name]), [[1, 'x'], [2, 'proj']])
 })
 
 test('审批：请求发到 IM，/y 编号 批准、/n 编号 原因 拒绝', () => {
