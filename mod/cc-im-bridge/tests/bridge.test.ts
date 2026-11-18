@@ -62,7 +62,7 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.3.1' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.4.0' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
@@ -238,4 +238,40 @@ test('worktree 会话登记时用仓库名命名', async ($, on) => {
   await $.session.start({ cwd: '/Users/me/work/.claude/worktrees/brave-noether-1a2b', surface: 'desktop', isInteractive: true })
   await clock.advance(2000)
   expect(calls[0]?.body.name).toBe('work-brave')
+})
+
+test('离开模式：本地发起的回合回复也发回 IM，且不受 /im-push off 影响', async ($, on) => {
+  const calls = fakeRelay(on, { '/mod/poll': () => ({ ok: true, messages: [] }) })
+  const { clock } = engineBeneath(on)
+  await startSession($)
+  await clock.advance(2000)
+  await $.command.run({ command: 'im-push', args: 'off' })
+  await $.command.run({ command: 'im-away', args: 'on' })
+
+  await $.turn.start({ text: '本地提问', turnId: 'l1' })
+  await $.turn.complete({ answer: '本地回复', durationMs: 1, isAborted: false, turnId: 'l1', reason: 'answer' })
+  expect(calls.filter(c => c.path === '/mod/reply').map(c => c.body.text)).toEqual(['本地回复'])
+})
+
+test('IM 指令：「离开」打开离开模式；「停」中断正在跑的回合；没在跑时告知', async ($, on) => {
+  const pending: object[][] = [[{ type: 'away', on: true }]]
+  const calls = fakeRelay(on, { '/mod/poll': () => ({ ok: true, messages: [], controls: pending.shift() ?? [] }) })
+  const aborted: string[] = []
+  on('turn.abort', (_, e) => {
+    aborted.push(e.turnId)
+    return { value: undefined }
+  })
+  const { clock } = engineBeneath(on)
+  await startSession($)
+  await clock.advance(2000)
+  expect((await $.command.run({ command: 'im-status', args: '' })).text).toContain('离开模式：on')
+
+  pending.push([{ type: 'abort' }])
+  await clock.advance(2000)
+  expect(calls.filter(c => c.path === '/mod/reply').at(-1)?.body.text).toBe('当前没有在运行的回合')
+
+  await $.turn.start({ text: '跑个长任务', turnId: 't9' })
+  pending.push([{ type: 'abort' }])
+  await clock.advance(2000)
+  expect(aborted).toEqual(['t9'])
 })

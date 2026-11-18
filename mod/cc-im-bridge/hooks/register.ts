@@ -1,7 +1,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
-const VERSION = '0.3.1'
+const VERSION = '0.4.0'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
 const NAME_PATTERN = /^[\w.\-一-龥]{1,32}$/
@@ -17,7 +17,9 @@ type RelayAnswer = {
   ok: boolean
   error?: string
   messages?: { text: string }[]
+  controls?: Control[]
 }
+type Control = { type: 'abort' } | { type: 'away'; on: boolean }
 
 // 模块每个会话加载一份，这里的状态就是本会话的状态；重载后由 session.start 重新填。
 const bridge = {
@@ -34,8 +36,10 @@ const bridge = {
   imTurnIds: new Set<string>(),
   // 主循环当前回合是不是 IM 发起的：是的话人可能不在电脑前，审批要转到 IM。
   isImTurn: false,
-  // 开启后本地发起的回合也把审批转到 IM。
+  // 离开模式：人不在电脑前。本会话所有回合的回复、审批、提问都发到 IM。
   isAway: false,
+  // 主循环正在跑的回合 id，IM 里说「停」时中断它。
+  runningTurnId: '',
 }
 
 // 审批真正发生在 settings 的 PermissionRequest 钩子里；mod 只告诉中转现在该不该转。
@@ -88,6 +92,7 @@ async function tick($: EngineInterface) {
     }
     if (!r.ok) throw new Error(`取信失败：${r.error ?? r.status}`)
     report($, undefined)
+    for (const c of r.controls ?? []) await applyControl($, c)
     for (const m of r.messages ?? []) {
       await $.prompt.submit({
         text: `${IM_MARKER}，本轮最终回复会自动发回 IM，请简洁]\n${m.text}`,
@@ -165,7 +170,7 @@ async function start($: EngineInterface, cwd: string) {
   })
   await $.command.register({
     name: 'im-away',
-    description: '离开电脑时开启：本地发起的回合需要批准时也发到 IM。/im-away on | off',
+    description: '离开模式：本会话的回复、审批、提问都发到 IM。/im-away on | off（IM 里也可说「离开」「回来了」）',
   })
   await $.tool.register({
     name: 'send',
@@ -183,7 +188,8 @@ async function start($: EngineInterface, cwd: string) {
 
 async function forwardAnswer($: EngineInterface, turnId: string, answer: string, isAborted: boolean) {
   const fromIm = bridge.imTurnIds.delete(turnId)
-  if (bridge.pushMode === 'off' || (bridge.pushMode === 'im' && !fromIm)) return
+  // 离开模式下每一轮都发；否则按 /im-push。
+  if (!bridge.isAway && (bridge.pushMode === 'off' || (bridge.pushMode === 'im' && !fromIm))) return
   const text = isAborted ? '（本轮被中断）' : answer.trim() || '（本轮没有文字回复）'
   try {
     await sendToIm($, text)
@@ -240,12 +246,33 @@ async function settleLocal($: EngineInterface, body: { tool?: string; summary?: 
 
 async function setAway($: EngineInterface, wanted: string) {
   if (wanted !== 'on' && wanted !== 'off') {
-    return `当前：${bridge.isAway ? 'on' : 'off'}。on：本地发起的回合也把审批转到 IM；off：只转 IM 发起的回合`
+    return `当前：${bridge.isAway ? 'on' : 'off'}。on：离开电脑，本会话的回复、审批、提问都发到 IM；off：只有 IM 发起的回合才发`
   }
   bridge.isAway = wanted === 'on'
   await $.store.set(`away:${bridge.sessionId}`, bridge.isAway)
   await pushForward($)
-  return bridge.isAway ? '已开启：需要批准时都会发到 IM' : '已关闭：只有 IM 发起的回合会把审批发到 IM'
+  $.ui.status(bridge.isAway ? `IM：${bridge.name}（离开模式）` : `IM：${bridge.name}`)
+  return bridge.isAway ? '已开启离开模式：回复、审批、提问都会发到 IM' : '已关闭离开模式'
+}
+
+// IM 里说「停」「离开」「回来了」，由中转随取信转来。
+async function applyControl($: EngineInterface, control: Control) {
+  try {
+    if (control.type === 'away') {
+      await setAway($, control.on ? 'on' : 'off')
+      return
+    }
+    if (control.type === 'abort') {
+      if (!bridge.runningTurnId) {
+        await sendToIm($, '当前没有在运行的回合')
+        return
+      }
+      // 中断后 turn.complete 以「本轮被中断」发回 IM，这里不用另发确认。
+      await $.turn.abort({ turnId: bridge.runningTurnId })
+    }
+  } catch (err) {
+    report($, `执行 IM 指令失败：${describe(err)}`)
+  }
 }
 
 function statusText() {
@@ -272,6 +299,7 @@ export const register: Register = on => {
 
   on('turn.start', async ($, e, next) => {
     if (!e.agentId) {
+      bridge.runningTurnId = e.turnId
       bridge.isImTurn = e.text.includes(IM_MARKER)
       if (bridge.isImTurn) bridge.imTurnIds.add(e.turnId)
       await pushForward($)
@@ -283,6 +311,7 @@ export const register: Register = on => {
     const done = await next(e)
     if (!e.agentId) {
       bridge.isImTurn = false
+      if (bridge.runningTurnId === e.turnId) bridge.runningTurnId = ''
       await pushForward($)
       await settleLocal($, {})
       await forwardAnswer($, e.turnId, e.answer, e.isAborted)

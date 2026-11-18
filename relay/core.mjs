@@ -13,6 +13,9 @@ export const STATUS_TEXT = { pending: '待批', approved: '已批准', denied: '
 const APPROVE_WORDS = new Set(['好', '好的', '好啊', '可以', '行', '批准', '同意', '确认', 'ok'])
 const DENY_WORDS = ['不行', '不可以', '不要', '不用', '拒绝', '不同意', '先别', '别', '不', 'no', 'n']
 const LIST_PHRASES = new Set(['/list', '/ls', '会话', '会话列表', '有哪些会话', '列一下会话', '列出会话', '看看会话'])
+const STOP_PHRASES = new Set(['停', '停止', '停下', '中断', '别做了', 'stop'])
+const AWAY_PHRASES = new Set(['离开', '我走了', '我离开了', '离开模式', '出门了'])
+const BACK_PHRASES = new Set(['回来了', '我回来了', '回来', '关闭离开模式'])
 const USE_PATTERN = /^(?:\/use|切到|切换到|换到)\s*(.+)$/
 
 // titleOf(sessionId)：会话在 Desktop 侧边栏上的标题（读不到返回 undefined），企微里优先用它显示和匹配。
@@ -99,6 +102,8 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
       version: version ?? '',
       lastSeen: now(),
       queue: existing?.queue ?? [],
+      // 给会话插件的控制指令（中断、开关离开模式），随取信一起拿走。
+      controls: existing?.controls ?? [],
       forward: existing?.forward ?? false,
     })
     return { ok: true, name }
@@ -119,7 +124,8 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     s.lastSeen = now()
     if (typeof forward === 'boolean') s.forward = forward
     const messages = s.queue.splice(0)
-    return { ok: true, messages }
+    const controls = s.controls.splice(0)
+    return { ok: true, messages, controls }
   }
 
   function reply({ sessionId, text }) {
@@ -186,13 +192,33 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
 
     if (naturalDecision(text)) return
 
+    if (STOP_PHRASES.has(text.toLowerCase())) {
+      const s = currentSession()
+      if (!s) return tell('不确定要停哪个会话：发「会话」点选一个')
+      s.controls.push({ type: 'abort' })
+      return tell(`已让 ${label(s)} 停下当前这一轮`)
+    }
+
+    // 离开 / 回来对所有在线会话生效：人离开电脑，哪个会话要找你都该找得到。
+    if (AWAY_PHRASES.has(text) || BACK_PHRASES.has(text)) {
+      const on = AWAY_PHRASES.has(text)
+      const online = [...sessions.values()].filter(isOnline)
+      if (online.length === 0) return tell('没有在线的会话')
+      for (const s of online) s.controls.push({ type: 'away', on })
+      return tell(
+        on
+          ? `已为 ${online.length} 个会话打开离开模式：回复、审批、提问都会发到这里`
+          : `已为 ${online.length} 个会话关闭离开模式`,
+      )
+    }
+
     if (text === '/pending') {
       const pending = pendingApprovals()
       return tell(pending.length === 0 ? '没有待批的请求' : pending.map(a => `#${a.id} ${a.name}：${a.toolLabel} ${a.detail.split('\n')[0]}`).join('\n'))
     }
 
     if (text === '/help') {
-      return tell('发「会话」点选要聊的会话，或说「切到 名字」；「名字：内容」直接发给某个会话；其余内容发给当前会话。审批：点卡片按钮，或回「好」「不行，原因」；/pending 查看待批')
+      return tell('发「会话」点选要聊的会话，或说「切到 名字」；「名字：内容」直接发给某个会话；其余内容发给当前会话。「停」中断当前会话这一轮；「离开」「回来了」开关所有会话的离开模式。审批：点卡片按钮，或回「好」「不行，原因」；/pending 查看待批')
     }
 
     const at = text.match(/^@(\S+)\s+([\s\S]+)$/)
@@ -211,13 +237,17 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
       if (s) return deliver(s, named[2])
     }
 
-    let s = target ? sessions.get(target) : undefined
-    if (!s) {
-      const online = [...sessions.values()].filter(isOnline)
-      if (online.length === 1) s = online[0]
-    }
+    const s = currentSession()
     if (!s) return tell('不确定发给哪个会话：发「会话」点选一个，或说「切到 名字」')
     deliver(s, text)
+  }
+
+  // 不带会话名的消息发给谁：选过的会话；没选过且只有一个在线时就是它。
+  function currentSession() {
+    const chosen = target ? sessions.get(target) : undefined
+    if (chosen) return chosen
+    const online = [...sessions.values()].filter(isOnline)
+    return online.length === 1 ? online[0] : undefined
   }
 
   // 切换之后不带会话名的消息发给谁。ref 可以是编号、名字或唯一前缀。
