@@ -15,6 +15,16 @@ export const STATUS_TEXT = { pending: '待批', approved: '已批准', denied: '
 const APPROVE_WORDS = new Set(['好', '好的', '好啊', '可以', '行', '批准', '同意', '确认', 'ok'])
 const DENY_WORDS = ['不行', '不可以', '不要', '不用', '拒绝', '不同意', '先别', '别', '不', 'no', 'n']
 const LIST_PHRASES = new Set(['/list', '/ls', '会话', '会话列表', '有哪些会话', '列一下会话', '列出会话', '看看会话'])
+const HELP_PHRASES = new Set(['/help', '用法', '帮助', 'help', '?', '？'])
+const HELP_TEXT = [
+  '会话：点选会话',
+  '切到 名字：之后发给它',
+  '名字：内容：只发这一条',
+  '停：中断当前这一轮',
+  '离开 / 回来了：开关离开模式',
+  '好 / 不行，原因：批准或拒绝',
+  '/pending：查看待批',
+].join('\n')
 const STOP_PHRASES = new Set(['停', '停止', '停下', '中断', '别做了', 'stop'])
 const AWAY_PHRASES = new Set(['离开', '我走了', '我离开了', '离开模式', '出门了'])
 const BACK_PHRASES = new Set(['回来了', '我回来了', '回来', '关闭离开模式'])
@@ -241,9 +251,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
       return tell(pending.length === 0 ? '没有待批的请求' : pending.map(a => `#${a.id} ${a.name}：${a.toolLabel} ${a.detail.split('\n')[0]}`).join('\n'))
     }
 
-    if (text === '/help') {
-      return tell('发「会话」点选要聊的会话，或说「切到 名字」；「名字：内容」直接发给某个会话；其余内容发给当前会话。「停」中断当前会话这一轮；「离开」「回来了」开关所有会话的离开模式。审批：点卡片按钮，或回「好」「不行，原因」；/pending 查看待批')
-    }
+    if (HELP_PHRASES.has(text.toLowerCase())) return tell(HELP_TEXT)
 
     const at = text.match(/^@(\S+)\s+([\s\S]+)$/)
     if (at) {

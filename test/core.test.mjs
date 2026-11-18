@@ -523,3 +523,13 @@ test('流式：带 reqId 的企微消息用流开头代替回执；进度与带 
   assert.equal(relay.since(0).at(-1).stream, undefined)
   assert.equal(relay.progress({ sessionId: 's1', tool: 'Bash' }).status, 400)
 })
+
+test('「用法」「/help」回简短用法，不发给会话', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  for (const say of ['用法', '/help', '帮助']) {
+    relay.handleIncoming(say)
+    assert.match(lastReply(), /^会话：点选会话\n切到 名字/)
+  }
+  assert.equal(relay.poll({ sessionId: 's1' }).messages.length, 0)
+})
