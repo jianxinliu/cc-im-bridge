@@ -120,7 +120,7 @@ scripts/launchd.sh uninstall
 claude plugin uninstall cc-im-bridge@cc-im-bridge-local
 ```
 
-再从 `~/.claude/settings.json` 删掉 `hooks.PermissionRequest`（安装时的备份在 `~/.claude/settings.json.bak-ccim-*`）。
+再从 `~/.claude/settings.json` 删掉 `hooks.PermissionRequest`。
 
 ## 开发
 
