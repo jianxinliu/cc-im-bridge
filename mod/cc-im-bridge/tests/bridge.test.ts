@@ -32,6 +32,8 @@ function engineBeneath(on: On, sessionId = 'abcd1234-session', repoRoot: string 
     return { value: undefined }
   })
   on('prompt.submit', (_, e) => {
+    // 要按用户原话提交，不套插件消息的说明。
+    if ((e.origin as { asUser?: boolean }).asUser !== true) throw new Error('应带 asUser 提交')
     submitted.push(e.text)
     return { text: e.text }
   })
@@ -62,7 +64,7 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.6.0' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.6.1' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
@@ -173,7 +175,7 @@ test('取信时上一轮还在跑：上一轮的回复不发 IM，IM 那一轮�
   expect(replies).toEqual(['收到，链路正常'])
 })
 
-const IM_PROMPT = '[来自 IM 的消息，本轮最终回复会自动发回 IM，请简洁]\n部署一下'
+const IM_PROMPT = '[企微 m1] 部署一下'
 const forwardFlags = (calls: Call[]) => calls.filter(c => c.path === '/mod/forward').map(c => c.body.forward)
 
 test('审批转发：IM 发起的回合开始时打开转发，结束时关闭并作废未答复的审批', async ($, on) => {
@@ -292,7 +294,7 @@ test('流式进度：IM 消息带 id 提交；该回合每个工具报一行进�
   const { submitted, clock } = engineBeneath(on)
   await startSession($)
   await clock.advance(2000)
-  expect(submitted[0]?.startsWith('[来自 IM 的消息 m7，')).toBe(true)
+  expect(submitted[0]).toBe('[企微 m7] 跑测试')
 
   await $.turn.start({ text: submitted[0] ?? '', turnId: 't1' })
   await $.tool.call({ tool: 'Bash', command: 'npm test' })

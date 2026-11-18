@@ -1,15 +1,15 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
-const VERSION = '0.6.0'
+const VERSION = '0.6.1'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
 const MAX_NAME_CHARS = 32
 // 冒号用作「名字：内容」的分隔，不能出现在名字里。
 const NAME_FORBIDDEN = /[:：\p{Cc}]/u
-// 提交进会话的 IM 消息都带这个开头；回合开始时据此认出由 IM 发起的回合。
-const IM_MARKER = '[来自 IM 的消息'
-const IM_MESSAGE_ID = /^\[来自 IM 的消息 (m\d+)/
+// 提交进会话的 IM 消息都带「[企微 m12] 」开头：回合开始时据此认出由 IM 发起的回合，
+// m12 是那条 IM 消息的 id，用来把进度和回复接到它的流式回复上。
+const IM_MESSAGE_ID = /^\[企微(?: (m\d+))?\] /
 // 与仓库 relay/summary.mjs 一致：审批摘要，用来作废「已在电脑上处理」的那条审批。
 const MAX_SUMMARY_CHARS = 1000
 const SUMMARY_FIELDS = ['command', 'file_path', 'url', 'path', 'pattern']
@@ -101,9 +101,8 @@ async function tick($: EngineInterface) {
     report($, undefined)
     for (const c of r.controls ?? []) await applyControl($, c)
     for (const m of r.messages ?? []) {
-      await $.prompt.submit({
-        text: `${IM_MARKER} ${m.id}，本轮最终回复会自动发回 IM，请简洁]\n${m.text}`,
-      })
+      // asUser：按用户自己的话提交，不套 Claude Code 默认的「某插件发来一条消息」说明。
+      await $.prompt.submit({ text: `[企微${m.id ? ` ${m.id}` : ''}] ${m.text}`, asUser: true })
     }
   } catch (err) {
     bridge.isRegistered = false
@@ -381,11 +380,12 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     if (!e.agentId) {
       bridge.runningTurnId = e.turnId
-      bridge.isImTurn = e.text.includes(IM_MARKER)
-      // 提示词开头形如「[来自 IM 的消息 m12，…」，m12 是那条 IM 消息的 id；旧格式没有 id 时记为空串。
-      const msgId = bridge.isImTurn ? (IM_MESSAGE_ID.exec(e.text)?.[1] ?? '') : ''
-      if (bridge.isImTurn) bridge.imTurns.set(e.turnId, msgId)
-      bridge.currentMsgId = msgId
+      const imMatch = IM_MESSAGE_ID.exec(e.text)
+      // 没有消息 id 时（中转没给）仍算 IM 回合，只是无法接到流式回复上。
+      const msgId = imMatch ? (imMatch[1] ?? '') : undefined
+      bridge.isImTurn = msgId !== undefined
+      if (msgId !== undefined) bridge.imTurns.set(e.turnId, msgId)
+      bridge.currentMsgId = msgId ?? ''
       await pushForward($)
     }
     return next(e)
