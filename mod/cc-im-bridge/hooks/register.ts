@@ -1,7 +1,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
-const VERSION = '0.7.2'
+const VERSION = '0.7.3'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
 const MAX_NAME_CHARS = 32
@@ -204,7 +204,11 @@ async function forwardAnswer($: EngineInterface, turnId: string, answer: string,
   const fromIm = msgId !== undefined
   bridge.imTurns.delete(turnId)
   // 离开模式下每一轮都发；否则按 /im-push。
-  if (!bridge.isAway && (bridge.pushMode === 'off' || (bridge.pushMode === 'im' && !fromIm))) return
+  if (!bridge.isAway && (bridge.pushMode === 'off' || (bridge.pushMode === 'im' && !fromIm))) {
+    // IM 发起的回合在企微那条消息上开了「思考中」，不发回复也要给它收尾，否则一直停在思考中。
+    if (fromIm && msgId) await sendToIm($, '（本轮已完成；按 /im-push off 设置，回复没有发回）', msgId).catch(err => report($, describe(err)))
+    return
+  }
   const text = isAborted ? '（本轮被中断）' : answer.trim() || '（本轮没有文字回复）'
   try {
     await sendToIm($, text, msgId || undefined)

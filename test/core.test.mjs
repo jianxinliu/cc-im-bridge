@@ -65,14 +65,18 @@ test('/list 标出默认会话与离线会话', () => {
   assert.equal(lastReply(), '  1. api（离线）  /w/api\n* 2. web  /w/web')
 })
 
-test('在线会话占用的名字不能被别的会话登记；离线后可以接手', () => {
+test('同名会话即使暂时离线也不让出名字（排队的消息、编号都保留）；离线超过一天才清理', () => {
   const { relay, clock } = setup()
   relay.register({ sessionId: 's1', name: 'api', cwd: '' })
-  const taken = relay.register({ sessionId: 's2', name: 'api', cwd: '' })
-  assert.equal(taken.status, 409)
+  relay.handleIncoming('@api 排队的消息')
   clock.advance(ONLINE_WINDOW_MS + 1)
-  assert.equal(relay.register({ sessionId: 's2', name: 'api', cwd: '' }).ok, true)
-  assert.equal(relay.poll({ sessionId: 's1' }).status, 404, '被接手的旧登记已移除')
+  assert.equal(relay.register({ sessionId: 's2', name: 'api', cwd: '' }).status, 409)
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['排队的消息'])
+
+  clock.advance(24 * 3600_000 + 1)
+  assert.equal(relay.register({ sessionId: 's2', name: 'api', cwd: '' }).ok, true, '离线超过一天的会话被清理后名字可用')
+  assert.equal(relay.poll({ sessionId: 's1' }).status, 404)
 })
 
 test('离线会话的消息排队，上线取信时拿到', () => {
@@ -157,7 +161,7 @@ test('编号固定：中转重启后按保存的编号还原，与重新登记�
   assert.deepEqual(restarted.list().map(r => [r.num, r.name]), [[1, 'api'], [2, 'web'], [3, 'pm'], [4, 'new']])
 })
 
-test('编号固定：14 天没出现的编号让出来；同名新会话接替离线旧会话时接过它的编号', () => {
+test('编号固定：14 天没出现的编号让出来；被清理的离线会话回来时仍用原编号', () => {
   let t = 1_000_000
   const old = { num: 1, seenAt: t - 15 * 24 * 3600_000 }
   const relay = createRelay({ now: () => t, initialNumbers: { gone: old, kept: { num: 2, seenAt: t } } })
@@ -165,9 +169,28 @@ test('编号固定：14 天没出现的编号让出来；同名新会话接替�
   assert.equal(relay.list()[0].num, 1, '过期的编号 1 让给新会话；编号 2 仍保留')
 
   relay.register({ sessionId: 'kept', name: 'proj', cwd: '' })
+  t += 25 * 3600_000
+  relay.register({ sessionId: 'other', name: 'y', cwd: '' })
+  relay.register({ sessionId: 'kept', name: 'proj', cwd: '' })
+  assert.deepEqual(relay.list().map(r => [r.num, r.name]), [[2, 'proj'], [3, 'y']])
+})
+
+test('编号固定：常用的会话定期写回最后出现时间，不会在首次登记 14 天后过期', () => {
+  let t = 1_000_000
+  const saved = []
+  const relay = createRelay({ now: () => t, onNumbersChange: n => saved.push(JSON.parse(JSON.stringify(n))) })
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
   t += 60_000
-  relay.register({ sessionId: 'kept-2', name: 'proj', cwd: '' })
-  assert.deepEqual(relay.list().map(r => [r.num, r.name]), [[1, 'x'], [2, 'proj']])
+  relay.poll({ sessionId: 's1' })
+  assert.equal(saved.length, 1, '一小时内不重复写')
+  for (let day = 1; day <= 20; day++) {
+    t += 24 * 3600_000
+    relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  }
+  const restarted = createRelay({ now: () => t, initialNumbers: saved.at(-1) })
+  restarted.register({ sessionId: 'new', name: 'n', cwd: '' })
+  restarted.register({ sessionId: 's1', name: 'api', cwd: '' })
+  assert.deepEqual(restarted.list().map(r => [r.num, r.name]), [[1, 'api'], [2, 'n']])
 })
 
 test('审批：请求发到 IM，/y 编号 批准、/n 编号 原因 拒绝', () => {
@@ -566,7 +589,7 @@ test('流式：带 reqId 的企微消息用流开头代替回执；进度与带 
   relay.register({ sessionId: 's1', name: 'api', cwd: '' })
   relay.handleIncoming('跑测试', { reqId: 'cb_1' })
   const start = relay.since(0).at(-1)
-  assert.deepEqual(start.stream, { key: 'm1', reqId: 'cb_1', phase: 'start', title: 'api' })
+  assert.deepEqual(start.stream, { key: 'm1', reqId: 'cb_1', phase: 'start', title: 'api', queued: false })
   const [msg] = relay.poll({ sessionId: 's1' }).messages
   assert.equal(msg.id, 'm1')
 
@@ -656,4 +679,27 @@ test('在电脑上发了消息而退出遥控时，通知里说明原因', () =>
   relay.awayFromSession({ sessionId: 's1', on: true })
   relay.awayFromSession({ sessionId: 's1', on: false, reason: 'typed' })
   assert.equal(lastReply(), 'api 已退出遥控（你在电脑上发了消息）')
+})
+
+test('流式：投给离线会话时，流开头标明已排队', () => {
+  const { relay, clock } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  clock.advance(ONLINE_WINDOW_MS + 1)
+  relay.handleIncoming('@api 晚点处理', { reqId: 'cb_9' })
+  assert.equal(relay.since(0).at(-1).stream.queued, true)
+})
+
+test('建议：切到别的会话后，回数字照常发给新会话，不再当作选建议', () => {
+  const { relay } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.register({ sessionId: 's2', name: 'web', cwd: '' })
+  relay.handleIncoming('切到 api')
+  relay.suggestions({ sessionId: 's1', items: ['跑测试', '提交'] })
+  relay.handleIncoming('切到 web')
+  relay.handleIncoming('2')
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).messages.map(m => m.text), ['2'])
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages, [])
+  relay.handleIncoming('切到 api')
+  relay.handleIncoming('2')
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['提交'], '切回来仍可用')
 })

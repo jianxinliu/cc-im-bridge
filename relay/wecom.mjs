@@ -211,6 +211,8 @@ export function createWecomAdapter({
   let isAuthenticated = false
   let chatId = initialChatId
   let sendChain = Promise.resolve()
+  // 文件上传要几十次往返，单独排队，不挡住审批卡片、回执等普通消息。
+  let uploadChain = Promise.resolve()
   const taskPrefix = `ccim_${Math.random().toString(36).slice(2, 10)}`
   const cards = new Map() // 审批编号 -> 发出时的卡片内容，用于点按钮后更新
   const questionCards = new Map() // `${id}:${index}` -> 发出时的提问卡片内容
@@ -440,7 +442,7 @@ export function createWecomAdapter({
   }
 
   function sendFile({ buffer, filename, kind }, fallbackText) {
-    const run = sendChain.then(async () => {
+    const run = uploadChain.then(async () => {
       if (!chatId) throw new Error('还不知道发给谁：先在企微里给机器人发一条消息')
       try {
         const mediaId = await uploadMedia(buffer, filename, kind)
@@ -450,7 +452,7 @@ export function createWecomAdapter({
         for (const chunk of splitByBytes(`${fallbackText}\n（文件没发出去：${err.message}）`)) await sendChunk(chatId, chunk)
       }
     })
-    sendChain = run.catch(() => {})
+    uploadChain = run.catch(() => {})
     return run
   }
 
@@ -633,12 +635,13 @@ export function createWecomAdapter({
     return [`⏳ ${st.title} 处理中…`, ...(skipped > 0 ? [`…前面还有 ${skipped} 步`] : []), ...shown.map(l => `· ${l}`)].join('\n')
   }
 
-  function streamStart({ key, reqId, title }, fallbackText) {
+  function streamStart({ key, reqId, title, queued }, fallbackText) {
     if (!reqId) return send(fallbackText)
     const st = { reqId, streamId: `${taskPrefix}_st_${key}`, startedAt: now(), title, lines: [], chain: Promise.resolve(), timer: null, isDead: false }
     streams.set(key, st)
     if (streams.size > DEDUP_SIZE) streams.delete(streams.keys().next().value)
-    return streamWrite(st, `⏳ ${title} 思考中…`, false).catch(err => {
+    const opening = queued ? `🕓 ${title} 不在线，消息已排队，上线后处理` : `⏳ ${title} 思考中…`
+    return streamWrite(st, opening, false).catch(err => {
       st.isDead = true
       log.warn(`企微：流式回复开头发送失败，改发文字：${err.message}`)
       return send(fallbackText)

@@ -64,7 +64,7 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.7.2' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.7.3' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
@@ -418,4 +418,29 @@ test('离开模式下，IM 转来的消息（插件提交）不会关闭离开�
   expect(submitted).toEqual(['[企微 m1] 继续'])
   expect((await $.command.run({ command: 'im-status', args: '' })).text).toContain('离开模式：on')
   expect(calls.filter(c => c.path === '/mod/away').map(c => c.body.on)).toEqual([true])
+})
+
+test('/im-push off 时，IM 发起的回合仍给那条消息收尾（不发回复内容）', async ($, on) => {
+  let pending = [{ id: 'm3', text: '跑测试' }]
+  const calls = fakeRelay(on, {
+    '/mod/poll': () => {
+      const messages = pending
+      pending = []
+      return { ok: true, messages }
+    },
+  })
+  const { submitted, clock } = engineBeneath(on)
+  await startSession($)
+  await $.command.run({ command: 'im-push', args: 'off' })
+  await clock.advance(2000)
+  await $.turn.start({ text: submitted[0] ?? '', turnId: 't1' })
+  await $.turn.complete({ answer: '详细结果', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  const reply = calls.filter(c => c.path === '/mod/reply').at(-1)?.body
+  expect(reply?.msgId).toBe('m3')
+  expect(String(reply?.text)).toContain('/im-push off')
+  expect(String(reply?.text)).not.toContain('详细结果')
+
+  await $.turn.start({ text: '本地', turnId: 't2' })
+  await $.turn.complete({ answer: '本地回复', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
+  expect(calls.filter(c => c.path === '/mod/reply').length).toBe(1)
 })

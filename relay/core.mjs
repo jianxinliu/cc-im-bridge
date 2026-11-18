@@ -36,10 +36,14 @@ const AWAY_WITH_TARGET = /^(?:离开|遥控)\s+(.+)$/
 const BACK_PHRASES = new Set(['回来了', '我回来了', '回来', '关闭离开模式'])
 const USE_PATTERN = /^(?:\/use|切到|切换到|换到)\s*(.+)$/
 
-// titleOf(sessionId)：会话在 Desktop 侧边栏上的标题（读不到返回 undefined），企微里优先用它显示和匹配。
 const NUMBER_KEEP_MS = 14 * 24 * 3600_000
 const MAX_KEPT_NUMBERS = 30
+// 编号的最后出现时间至多每小时写一次盘：够判断 14 天没出现，又不会每次取信都写文件。
+const NUMBER_TOUCH_MS = 3600_000
+// 离线超过一天的会话从会话表里移除（它的编号仍保留），免得关掉的会话一直挂在列表里。
+const STALE_SESSION_MS = 24 * 3600_000
 
+// titleOf(sessionId)：会话在 Desktop 侧边栏上的标题（读不到返回 undefined），企微里优先用它显示和匹配。
 // initialTarget / onTargetChange：当前会话的持久化，让中转重启后不用重新选会话。
 // initialNumbers / onNumbersChange：会话编号的持久化（会话 id -> { num, seenAt }），
 // 让同一个会话一直用同一个编号，不随中转重启、登记先后而变。
@@ -91,7 +95,8 @@ export function createRelay({
   )
 
   function rememberNumber(sessionId, num) {
-    const before = numbers.get(sessionId)?.num
+    const before = numbers.get(sessionId)
+    if (before?.num === num && now() - before.seenAt < NUMBER_TOUCH_MS) return
     numbers.set(sessionId, { num, seenAt: now() })
     // 记太多时，先让出最久没出现、且不在线的。
     if (numbers.size > MAX_KEPT_NUMBERS) {
@@ -100,7 +105,7 @@ export function createRelay({
         .sort((a, b) => a[1].seenAt - b[1].seenAt)
       for (const [id] of removable.slice(0, numbers.size - MAX_KEPT_NUMBERS)) numbers.delete(id)
     }
-    if (before !== num) onNumbersChange(Object.fromEntries(numbers))
+    onNumbersChange(Object.fromEntries(numbers))
   }
 
   // 新会话取最小的空闲编号：在线会话和记着的编号都不占用。
@@ -140,20 +145,16 @@ export function createRelay({
 
   function register({ sessionId, name, cwd, version }) {
     if (!sessionId || !name) return { ok: false, status: 400, error: 'sessionId 和 name 必填' }
+    pruneStale()
+    // 同名会话即使暂时离线（Desktop 会回收空闲会话的进程）也不让出名字：它可能还有排队的消息，
+    // 回来时要接着用。插件收到 409 会在名字后加会话 id 前缀再登记。
     const holder = byName(name)
-    if (holder && holder.sessionId !== sessionId && isOnline(holder)) {
-      return { ok: false, status: 409, error: `名字 ${name} 已被在线会话占用` }
-    }
-    let inherited
     if (holder && holder.sessionId !== sessionId) {
-      // 同名的离线会话被新会话接替（例如同一目录开了新会话），编号也一并接过来。
-      inherited = holder.num
-      sessions.delete(holder.sessionId)
-      numbers.delete(holder.sessionId)
+      return { ok: false, status: 409, error: `名字 ${name} 已被会话 ${holder.num} 占用` }
     }
     const existing = sessions.get(sessionId)
-    const num = existing?.num ?? numbers.get(sessionId)?.num ?? inherited ?? freeNumber()
-    if (!existing) rememberNumber(sessionId, num)
+    const num = existing?.num ?? numbers.get(sessionId)?.num ?? freeNumber()
+    rememberNumber(sessionId, num)
     sessions.set(sessionId, {
       sessionId,
       num,
@@ -171,6 +172,15 @@ export function createRelay({
     return { ok: true, name }
   }
 
+  function pruneStale() {
+    for (const [id, s] of sessions) {
+      if (now() - s.lastSeen > STALE_SESSION_MS) {
+        sessions.delete(id)
+        if (target === id) setTarget(null)
+      }
+    }
+  }
+
   function unregister({ sessionId }) {
     const s = sessions.get(sessionId)
     if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
@@ -186,6 +196,7 @@ export function createRelay({
     s.lastSeen = now()
     if (typeof forward === 'boolean') s.forward = forward
     if (typeof away === 'boolean') s.away = away
+    rememberNumber(sessionId, s.num)
     const messages = s.queue.splice(0)
     const controls = s.controls.splice(0)
     return { ok: true, messages, controls }
@@ -248,7 +259,14 @@ export function createRelay({
     s.queue.push({ id, text, ts: now() })
     setTarget(s.sessionId)
     const receipt = isOnline(s) ? `→ ${label(s)}` : `→ ${label(s)}（会话离线，已排队，上线后投递）`
-    if (meta.reqId) pushLog({ dir: 'out', from: 'relay', text: receipt, stream: { key: id, reqId: meta.reqId, phase: 'start', title: label(s) } })
+    if (meta.reqId) {
+      pushLog({
+        dir: 'out',
+        from: 'relay',
+        text: receipt,
+        stream: { key: id, reqId: meta.reqId, phase: 'start', title: label(s), queued: !isOnline(s) },
+      })
+    }
     else tell(receipt)
   }
 
@@ -290,8 +308,13 @@ export function createRelay({
       return tell(`正在让 ${label(s)} 想几个下一步…`)
     }
 
-    // 刚给过建议时，单独回一个编号就发送那条。
-    if (/^\d$/.test(text) && latestSuggestions && now() - latestSuggestions.createdAt <= SUGGESTION_TTL_MS) {
+    // 刚给过建议时，单独回一个编号就发送那条；只认当前会话的建议，切到别的会话后数字照常发给它。
+    if (
+      /^\d$/.test(text) &&
+      latestSuggestions &&
+      latestSuggestions.sessionId === currentSession()?.sessionId &&
+      now() - latestSuggestions.createdAt <= SUGGESTION_TTL_MS
+    ) {
       const r = sendSuggestion({ id: latestSuggestions.id, n: Number(text) })
       if (!r.ok) tell(r.error)
       return

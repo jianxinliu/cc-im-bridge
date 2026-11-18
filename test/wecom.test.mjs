@@ -767,3 +767,32 @@ test('发文件失败（如上传初始化没给 upload_id）时改发文字并�
   ackLast(socket())
   await sending
 })
+
+test('流式：会话离线时开头写「已排队」而不是「思考中」', async () => {
+  const { socket, adapter } = streamSetup()
+  adapter.sendStream({ key: 'q1', reqId: 'cb_q', phase: 'start', title: 'api', queued: true }, '', '→ api')
+  await tick()
+  assert.equal(streamFrames(socket()).at(-1).body.stream.content, '🕓 api 不在线，消息已排队，上线后处理')
+  ackLast(socket())
+})
+
+test('上传文件不挡住普通消息：上传进行中，审批卡片照常先发出', async () => {
+  const { socket, authOk, adapter } = setup()
+  authOk()
+  socket().serverSays(textFrame('alice', 'hi'))
+  const uploading = adapter.sendFile({ buffer: Buffer.alloc(10), filename: 'a.txt', kind: 'file' }, 'x')
+  await tick()
+  assert.equal(socket().lastSent().cmd, 'aibot_upload_media_init')
+  const initFrame = socket().lastSent()
+  const card = adapter.sendApprovalCard(approval, 'x')
+  await tick()
+  assert.equal(socket().lastSent().body.msgtype, 'template_card', '上传还没完成，卡片已经发出')
+  ackLast(socket())
+  await card
+  socket().serverSays({ headers: { req_id: initFrame.headers.req_id }, errcode: 0, body: {} })
+  for (let i = 0; i < 4; i++) {
+    await tick()
+    if (socket().lastSent().cmd === 'aibot_send_msg' && socket().lastSent().body.msgtype === 'markdown') ackLast(socket())
+  }
+  await uploading
+})

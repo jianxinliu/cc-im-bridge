@@ -93,7 +93,8 @@ const INBOX = join(HOME, 'inbox')
 // 收到的附件存进 inbox/日期/，权限只给本人；返回存好的路径。
 function saveInbound({ buffer, filename }) {
   const now = new Date()
-  const day = now.toISOString().slice(0, 10)
+  // 按本机时区的日期分目录，与文件名里的时间一致。
+  const day = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
   const dir = join(INBOX, day)
   mkdirSync(dir, { recursive: true, mode: 0o700 })
   const stamp = now.toTimeString().slice(0, 8).replace(/:/g, '')
