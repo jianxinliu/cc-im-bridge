@@ -43,6 +43,11 @@ install)
 </plist>
 EOF
   launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+  # bootout 是异步的：旧实例没退干净时 bootstrap 会报 5（Input/output error），等它消失再加载。
+  for _ in {1..50}; do
+    launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || break
+    sleep 0.2
+  done
   launchctl bootstrap "$DOMAIN" "$PLIST"
   echo "已安装并启动：$PLIST"
   echo "日志：$DATA/relay.log"
