@@ -28,6 +28,8 @@
 
 ## 踩过的坑（实测结论）
 
+- **安装或 `claude plugin update` 前，`mod/` 里不能有未提交的临时代码**：它会被原样复制进插件缓存，跑在各个会话里。2026-11-17 安装时工作区里正留着一段临时诊断代码（把每次权限判定写进 `~/.cc-im-bridge/diag-tool-check.json`），被装进了 0.2.1 的缓存，Desktop 重启后回落到 0.2.1 的会话一直在写这个文件。更新前先 `git status` 确认 `mod/` 干净。
+
 - 企微长连接握手区分请求头大小写：只认 `Sec-WebSocket-Key`，小写返回 404。Node 自带 WebSocket（undici）改不了头名。
 - 企微卡片点击事件：`event_key`、`task_id` 在 `body.event.template_card_event` 下，官方 SDK 1.0.7 类型写在 `body.event` 下。更新卡片要在 5 秒内用**该事件的 req_id** 发 `aibot_respond_update_msg`。
 - 审批编号每次启动从 1 计，卡片 `task_id` 带启动随机前缀，点击时校验，旧卡片不生效。
