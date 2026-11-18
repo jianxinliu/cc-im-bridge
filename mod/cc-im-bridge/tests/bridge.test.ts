@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, On } from 'claude-code/testing'
 
-import { defaultName, normalizeName } from '../hooks/register'
+import { defaultName, normalizeName, parseSuggestions } from '../hooks/register'
 
 type Call = { path: string; body: Record<string, unknown> }
 
@@ -62,7 +62,7 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.5.2' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.6.0' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
@@ -328,4 +328,33 @@ test('名字规整：合并空格、去首尾空格；空、超长、含冒号�
   expect(normalizeName('中'.repeat(32))).toBe('中'.repeat(32))
   expect(normalizeName('a:b')).toBe(undefined)
   expect(normalizeName('a\u0007b')).toBe(undefined)
+})
+
+test('解析建议：JSON 数组优先；否则按行拆并去掉编号符号；最多 4 条', () => {
+  expect(parseSuggestions('好的：["跑测试","提交代码"]')).toEqual(['跑测试', '提交代码'])
+  expect(parseSuggestions('1. 跑测试\n2、提交\n- "写文档"\n\n• 推送\n5) 多余')).toEqual(['跑测试', '提交', '写文档', '推送'])
+  expect(parseSuggestions('[坏 json\n一条')).toEqual(['[坏 json', '一条'])
+})
+
+test('建议：收到 suggest 指令时 fork 本会话生成，结果交给中转；没上下文时转告原因', async ($, on) => {
+  const pending: object[][] = [[{ type: 'suggest' }]]
+  const calls = fakeRelay(on, { '/mod/poll': () => ({ ok: true, messages: [], controls: pending.shift() ?? [] }) })
+  const prompts: string[] = []
+  let answer: object = { value: { isAnswered: true, text: '["跑一下测试","提交改动"]', usage: {} } }
+  on('model.fork', (_, e) => {
+    prompts.push(e.prompt)
+    return answer
+  })
+  const { clock } = engineBeneath(on)
+  await startSession($)
+  await clock.advance(2000)
+  await clock.settle()
+  expect(prompts[0]).toContain('只输出一个 JSON 字符串数组')
+  expect(calls.find(c => c.path === '/mod/suggestions')?.body).toEqual({ sessionId: 'abcd1234-session', items: ['跑一下测试', '提交改动'] })
+
+  answer = { value: { isAnswered: false, reason: 'nothing-to-fork' } }
+  pending.push([{ type: 'suggest' }])
+  await clock.advance(2000)
+  await clock.settle()
+  expect(calls.filter(c => c.path === '/mod/suggestions').at(-1)?.body.error).toContain('还没有可参考的上下文')
 })

@@ -1,7 +1,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
-const VERSION = '0.5.2'
+const VERSION = '0.6.0'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
 const MAX_NAME_CHARS = 32
@@ -22,7 +22,7 @@ type RelayAnswer = {
   messages?: { id: string; text: string }[]
   controls?: Control[]
 }
-type Control = { type: 'abort' } | { type: 'away'; on: boolean }
+type Control = { type: 'abort' } | { type: 'away'; on: boolean } | { type: 'suggest' }
 
 // 模块每个会话加载一份，这里的状态就是本会话的状态；重载后由 session.start 重新填。
 const bridge = {
@@ -45,6 +45,8 @@ const bridge = {
   isAway: false,
   // 主循环正在跑的回合 id，IM 里说「停」时中断它。
   runningTurnId: '',
+  // 正在生成下一步建议：一次只生成一组。
+  isSuggesting: false,
 }
 
 // 审批真正发生在 settings 的 PermissionRequest 钩子里；mod 只告诉中转现在该不该转。
@@ -277,11 +279,68 @@ async function setAway($: EngineInterface, wanted: string) {
   return bridge.isAway ? '已开启离开模式：回复、审批、提问都会发到 IM' : '已关闭离开模式'
 }
 
+// 不指定推理强度：指定一个与会话不同的强度时，部分模型要把整段对话重新写一遍缓存，对话越长越贵。
+// 改为在提示里要求直接作答。
+const SUGGEST_PROMPT = [
+  '（这是 IM 桥接插件的后台请求，不是用户在对话。不要调用工具，不要思考过程，直接作答。）',
+  '根据以上对话，列出用户接下来最可能让你做的 3 到 4 件事。',
+  '每条写成用户会直接发给你的一句话，不超过 25 个字。',
+  '只输出一个 JSON 字符串数组，例如 ["跑一下全部测试","把改动提交"]，不要其他内容。',
+].join('\n')
+const MAX_SUGGESTIONS = 4
+
+// 从模型回复里取出建议：优先按 JSON 数组解析，不行就按行拆、去掉编号和符号。
+export function parseSuggestions(text: string) {
+  const json = /\[[\s\S]*\]/.exec(text)?.[0]
+  if (json) {
+    try {
+      const list: unknown = JSON.parse(json)
+      if (Array.isArray(list)) {
+        return list.map(item => String(item).trim()).filter(Boolean).slice(0, MAX_SUGGESTIONS)
+      }
+    } catch {
+      // 不是合法 JSON 时按行拆
+    }
+  }
+  return text
+    .split('\n')
+    .map(line => line.replace(/^\s*(?:[-*•·]|\d+[.、)）])\s*/, '').replace(/^["“]|["”]$/g, '').trim())
+    .filter(Boolean)
+    .slice(0, MAX_SUGGESTIONS)
+}
+
+async function suggestNext($: EngineInterface) {
+  if (bridge.isSuggesting) return
+  bridge.isSuggesting = true
+  try {
+    const r = await $.model.fork({ prompt: SUGGEST_PROMPT })
+    let body: { items?: string[]; error?: string }
+    if (r.isAnswered) {
+      const items = parseSuggestions(r.text)
+      body = items.length ? { items } : { error: '没想出合适的下一步' }
+    } else if (r.reason === 'nothing-to-fork') {
+      body = { error: '这个会话还没有可参考的上下文，先聊一轮' }
+    } else {
+      body = { error: `生成建议失败（${r.reason}）` }
+    }
+    await call($, '/mod/suggestions', { sessionId: bridge.sessionId, ...body })
+  } catch (err) {
+    report($, `生成建议失败：${describe(err)}`)
+  } finally {
+    bridge.isSuggesting = false
+  }
+}
+
 // IM 里说「停」「离开」「回来了」，由中转随取信转来。
 async function applyControl($: EngineInterface, control: Control) {
   try {
     if (control.type === 'away') {
       await setAway($, control.on ? 'on' : 'off')
+      return
+    }
+    if (control.type === 'suggest') {
+      // 调模型要几秒到十几秒，不能占着取信。
+      void suggestNext($)
       return
     }
     if (control.type === 'abort') {

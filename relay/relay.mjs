@@ -87,6 +87,7 @@ const modRoutes = {
   'POST /mod/poll': relay.poll,
   'POST /mod/reply': relay.reply,
   'POST /mod/progress': relay.progress,
+  'POST /mod/suggestions': relay.suggestions,
   'POST /mod/approval/request': relay.requestApproval,
   'POST /mod/approval/cancel': relay.cancelApproval,
   'POST /mod/forward': relay.setForward,
@@ -246,6 +247,7 @@ try {
         return r.ok ? r.rows : null
       },
       onQuestionPick: pick => relay.pickQuestionOption(pick),
+      onSuggestionPick: pick => relay.sendSuggestion(pick),
       onCardAction: ({ id, approve }) => {
         const r = relay.decideApproval({ id, approve })
         return r.approval ?? null
@@ -263,6 +265,8 @@ try {
           ? wecom.sendSessionsCard(entry.awayPicker, formatOutgoing(entry), 'away')
           : entry.question
             ? wecom.sendQuestionCard(entry.question, formatOutgoing(entry))
+          : entry.suggestions
+            ? wecom.sendSuggestionsCard(entry.suggestions, formatOutgoing(entry))
             : wecom.send(formatOutgoing(entry))
       ).catch(
         err => console.error(`发往企微失败：${err.message}`),

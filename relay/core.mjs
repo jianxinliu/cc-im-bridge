@@ -15,6 +15,9 @@ export const STATUS_TEXT = { pending: '待批', approved: '已批准', denied: '
 const APPROVE_WORDS = new Set(['好', '好的', '好啊', '可以', '行', '批准', '同意', '确认', 'ok'])
 const DENY_WORDS = ['不行', '不可以', '不要', '不用', '拒绝', '不同意', '先别', '别', '不', 'no', 'n']
 const LIST_PHRASES = new Set(['/list', '/ls', '会话', '会话列表', '有哪些会话', '列一下会话', '列出会话', '看看会话'])
+const SUGGEST_PHRASES = new Set(['建议', '接下来做什么', '下一步', '有什么建议'])
+const SUGGESTION_TTL_MS = 10 * 60_000
+const MAX_SUGGESTIONS = 4
 const HELP_PHRASES = new Set(['/help', '用法', '帮助', 'help', '?', '？'])
 const HELP_TEXT = [
   '会话：点选会话',
@@ -24,6 +27,7 @@ const HELP_TEXT = [
   '离开：选一个会话遥控（离开 2：直接指定）',
   '回来了：所有会话退出遥控',
   '好 / 不行，原因：批准或拒绝',
+  '建议：按会话上下文给几个下一步，点编号发送',
   '/pending：查看待批',
 ].join('\n')
 const STOP_PHRASES = new Set(['停', '停止', '停下', '中断', '别做了', 'stop'])
@@ -51,6 +55,9 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
   const questionListeners = []
   let questionSeq = 0
   let messageSeq = 0
+  // 最近一次的「下一步建议」：{ id, sessionId, items, createdAt }。回复编号或点卡片按钮即发送对应那条。
+  let latestSuggestions = null
+  let suggestionSeq = 0
   let approvalSeq = 0
 
   const isOnline = s => now() - s.lastSeen <= ONLINE_WINDOW_MS
@@ -230,6 +237,21 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
 
     if (answerFromText(text)) return
 
+    if (SUGGEST_PHRASES.has(text)) {
+      const s = currentSession()
+      if (!s) return tell('先选一个会话：发「会话」点选')
+      if (!isOnline(s)) return tell(`${label(s)} 不在线`)
+      requestSuggestions(s)
+      return tell(`正在让 ${label(s)} 想几个下一步…`)
+    }
+
+    // 刚给过建议时，单独回一个编号就发送那条。
+    if (/^\d$/.test(text) && latestSuggestions && now() - latestSuggestions.createdAt <= SUGGESTION_TTL_MS) {
+      const r = sendSuggestion({ id: latestSuggestions.id, n: Number(text) })
+      if (!r.ok) tell(r.error)
+      return
+    }
+
     if (naturalDecision(text)) return
 
     if (STOP_PHRASES.has(text.toLowerCase())) {
@@ -307,6 +329,53 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     return online.length === 1 ? online[0] : undefined
   }
 
+  // 让会话插件按上下文生成几条下一步建议（插件调模型，结果经 suggestions() 回来）。
+  function requestSuggestions(s) {
+    if (!isOnline(s) || s.controls.some(c => c.type === 'suggest')) return
+    s.controls.push({ type: 'suggest' })
+  }
+
+  function suggestions({ sessionId, items, error }) {
+    const s = sessions.get(sessionId)
+    if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
+    if (error) {
+      tell(`${label(s)}：${error}`)
+      return { ok: true }
+    }
+    const clean = (Array.isArray(items) ? items : [])
+      .map(t => String(t).replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .slice(0, MAX_SUGGESTIONS)
+    if (clean.length === 0) {
+      tell(`${label(s)}：没想出合适的下一步`)
+      return { ok: true }
+    }
+    latestSuggestions = { id: ++suggestionSeq, sessionId, items: clean, createdAt: now() }
+    pushLog({
+      dir: 'out',
+      from: label(s),
+      text: ['接下来可以：', ...clean.map((t, i) => `${i + 1}. ${t}`), '回复编号发送'].join('\n'),
+      suggestions: { id: latestSuggestions.id, name: label(s), items: clean },
+    })
+    return { ok: true }
+  }
+
+  // 发送第 n 条建议（从 1 起），像用户自己说的一样投给会话。
+  function sendSuggestion({ id, n }) {
+    const sug = latestSuggestions
+    if (!sug || sug.id !== Number(id) || now() - sug.createdAt > SUGGESTION_TTL_MS) {
+      return { ok: false, error: '这组建议已过期，发「建议」重新生成' }
+    }
+    const text = sug.items[n - 1]
+    const s = sessions.get(sug.sessionId)
+    if (!text) return { ok: false, error: `没有第 ${n} 条建议` }
+    if (!s) return { ok: false, error: '会话已不存在' }
+    // 发出一条后这组建议就用掉了，免得之后回的数字又被当成选建议。
+    latestSuggestions = null
+    deliver(s, text)
+    return { ok: true, text }
+  }
+
   // 遥控一个会话：它进入离开模式并成为当前会话；同一时间只遥控一个，其他会话退出离开模式，
   // 否则多个会话的回复会一起涌进 IM。
   function awaySession(ref) {
@@ -322,6 +391,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     if (!s.away) s.controls.push({ type: 'away', on: true })
     s.away = true
     setTarget(s.sessionId)
+    requestSuggestions(s)
     const switched = released.length ? `（${released.join('、')} 已退出遥控）` : ''
     return {
       ok: true,
@@ -336,6 +406,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     const { session: s, error } = resolve(String(ref))
     if (!s) return { ok: false, error }
     setTarget(s.sessionId)
+    requestSuggestions(s)
     return { ok: true, name: label(s), num: s.num }
   }
 
@@ -640,6 +711,8 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
     decideApproval,
     useSession,
     awaySession,
+    suggestions,
+    sendSuggestion,
     tell,
     setForward,
     hookPermission,

@@ -3,6 +3,9 @@ import { test } from 'node:test'
 
 import { ONLINE_WINDOW_MS, createRelay } from '../relay/core.mjs'
 
+// 切换会话会顺带下发「生成建议」，只关心其他指令的断言用它过滤掉。
+const nonSuggest = r => r.controls.filter(c => c.type !== 'suggest')
+
 function setup() {
   let t = 1_000_000
   const clock = { now: () => t, advance: ms => (t += ms) }
@@ -420,9 +423,9 @@ test('「停」给当前会话下发中断；没有当前会话时提示选择',
   relay.handleIncoming('切到 web')
   relay.handleIncoming('停')
   assert.equal(lastReply(), '已让 web 停下当前这一轮')
-  assert.deepEqual(relay.poll({ sessionId: 's2' }).controls, [{ type: 'abort' }])
-  assert.deepEqual(relay.poll({ sessionId: 's2' }).controls, [], '指令取走后不再重复给')
-  assert.deepEqual(relay.poll({ sessionId: 's1' }).controls, [])
+  assert.deepEqual(nonSuggest(relay.poll({ sessionId: 's2' })), [{ type: 'abort' }])
+  assert.deepEqual(nonSuggest(relay.poll({ sessionId: 's2' })), [], '指令取走后不再重复给')
+  assert.deepEqual(nonSuggest(relay.poll({ sessionId: 's1' })), [])
 })
 
 test('「离开」：只有一个在线会话时直接遥控它；多个时回选择卡片', () => {
@@ -430,14 +433,14 @@ test('「离开」：只有一个在线会话时直接遥控它；多个时回�
   relay.register({ sessionId: 's1', name: 'api', cwd: '' })
   relay.handleIncoming('离开')
   assert.match(lastReply(), /^正在遥控 api/)
-  assert.deepEqual(relay.poll({ sessionId: 's1' }).controls, [{ type: 'away', on: true }])
+  assert.deepEqual(nonSuggest(relay.poll({ sessionId: 's1' })), [{ type: 'away', on: true }])
 
   relay.register({ sessionId: 's2', name: 'web', cwd: '' })
   relay.handleIncoming('离开')
   const picker = relay.since(0).at(-1)
   assert.deepEqual(picker.awayPicker.map(r => [r.num, r.name, r.away]), [[1, 'api', true], [2, 'web', false]])
   assert.match(picker.text, /选择要遥控的会话/)
-  assert.deepEqual(relay.poll({ sessionId: 's2' }).controls, [], '选之前不动任何会话')
+  assert.deepEqual(nonSuggest(relay.poll({ sessionId: 's2' })), [], '选之前不动任何会话')
 })
 
 test('遥控同一时间只有一个会话：「离开 2」切过去，原来的退出；也会成为当前会话', () => {
@@ -445,13 +448,13 @@ test('遥控同一时间只有一个会话：「离开 2」切过去，原来的
   relay.register({ sessionId: 's1', name: 'api', cwd: '' })
   relay.register({ sessionId: 's2', name: 'web', cwd: '' })
   relay.handleIncoming('离开 api')
-  assert.deepEqual(relay.poll({ sessionId: 's1' }).controls, [{ type: 'away', on: true }])
+  assert.deepEqual(nonSuggest(relay.poll({ sessionId: 's1' })), [{ type: 'away', on: true }])
   relay.handleIncoming('离开 2')
   assert.equal(lastReply(), '正在遥控 web：它每一轮的回复、审批、提问都发到这里（api 已退出遥控）。回到电脑说「回来了」')
-  assert.deepEqual(relay.poll({ sessionId: 's1' }).controls, [{ type: 'away', on: false }])
-  assert.deepEqual(relay.poll({ sessionId: 's2' }).controls, [{ type: 'away', on: true }])
+  assert.deepEqual(nonSuggest(relay.poll({ sessionId: 's1' })), [{ type: 'away', on: false }])
+  assert.deepEqual(nonSuggest(relay.poll({ sessionId: 's2' })), [{ type: 'away', on: true }])
   relay.handleIncoming('离开 2')
-  assert.deepEqual(relay.poll({ sessionId: 's2' }).controls, [], '已在遥控中不重复下发')
+  assert.deepEqual(nonSuggest(relay.poll({ sessionId: 's2' })), [], '已在遥控中不重复下发')
   relay.handleIncoming('继续')
   assert.deepEqual(relay.poll({ sessionId: 's2' }).messages.map(m => m.text), ['继续'])
   relay.handleIncoming('离开 nope')
@@ -469,7 +472,7 @@ test('会话列表标出遥控中的会话（以插件上报为准）；「回�
 
   relay.handleIncoming('回来了')
   assert.equal(lastReply(), '已关闭离开模式：api')
-  for (const id of ['s1', 's2']) assert.deepEqual(relay.poll({ sessionId: id }).controls, [{ type: 'away', on: false }])
+  for (const id of ['s1', 's2']) assert.deepEqual(nonSuggest(relay.poll({ sessionId: id })), [{ type: 'away', on: false }])
   assert.equal(relay.list().some(r => r.away), false)
   relay.handleIncoming('回来了')
   assert.equal(lastReply(), '没有开着离开模式的会话')
@@ -566,4 +569,41 @@ test('「用法」「/help」回简短用法，不发给会话', () => {
     assert.match(lastReply(), /^会话：点选会话\n切到 名字/)
   }
   assert.equal(relay.poll({ sessionId: 's1' }).messages.length, 0)
+})
+
+test('建议：切换会话后让它生成建议；结果以卡片发出，回编号就发送那条，发完即作废', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.register({ sessionId: 's2', name: 'web', cwd: '' })
+  relay.handleIncoming('切到 web')
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).controls, [{ type: 'suggest' }])
+
+  relay.suggestions({ sessionId: 's2', items: ['  跑一下测试 ', '', '提交代码', '写文档', '推送', '第五条不要'] })
+  const card = relay.since(0).at(-1)
+  assert.deepEqual(card.suggestions.items, ['跑一下测试', '提交代码', '写文档', '推送'])
+  assert.match(card.text, /^接下来可以：\n1\. 跑一下测试/)
+
+  relay.handleIncoming('2')
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).messages.map(m => m.text), ['提交代码'])
+  relay.handleIncoming('2')
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).messages.map(m => m.text), ['2'], '用掉后数字当普通消息')
+  assert.equal(relay.sendSuggestion({ id: card.suggestions.id, n: 1 }).ok, false)
+})
+
+test('建议：发「建议」对当前会话生成；会话出错时转告；超过 10 分钟作废；重复请求不重复下发', () => {
+  const { relay, clock, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.handleIncoming('建议')
+  relay.handleIncoming('建议')
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).controls, [{ type: 'suggest' }])
+  relay.suggestions({ sessionId: 's1', error: '这个会话还没有可参考的上下文' })
+  assert.equal(lastReply(), 'api：这个会话还没有可参考的上下文')
+
+  relay.suggestions({ sessionId: 's1', items: ['甲'] })
+  const { id } = relay.since(0).at(-1).suggestions
+  clock.advance(10 * 60_000 + 1)
+  assert.match(relay.sendSuggestion({ id, n: 1 }).error, /已过期/)
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.handleIncoming('1')
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['1'])
 })

@@ -52,6 +52,23 @@ export function parseCardKey(key) {
 const MAX_SESSION_BUTTONS = 6 // 企微按钮卡片最多 6 个按钮
 const SESSION_KEY = /^(use|away):(\d+)$/
 const QUESTION_KEY = /^q:(\d+):(\d+):(\d+)$/
+const SUGGESTION_KEY = /^sug:(\d+):(\d+)$/
+
+// 下一步建议卡片：建议写在正文里，按钮只放编号（按钮太窄放不下句子）。
+export function suggestionsCard({ id, name, items }, taskPrefix, sent) {
+  const card = {
+    card_type: 'button_interaction',
+    source: { desc: 'cc-im-bridge' },
+    main_title: { title: `${name} 接下来可以`, desc: sent ? `已发送：${sent}` : '点编号直接发给它' },
+    sub_title_text: items.map((t, i) => `${i + 1}. ${t}`).join('\n'),
+    card_action: { type: 0 },
+    task_id: `${taskPrefix}_g${id}`,
+  }
+  card.button_list = sent
+    ? [{ text: '已发送', style: 2, key: `sug:${id}:done` }]
+    : items.map((_, i) => ({ text: String(i + 1), style: 2, key: `sug:${id}:${i + 1}` }))
+  return card
+}
 
 // 提问卡片：单选且选项不超过 6 个时，每个选项一个编号按钮；多选或选项多时用文字回复编号。
 export function questionCard(card, taskPrefix, chosen) {
@@ -158,6 +175,8 @@ export function createWecomAdapter({
   onAwaySession = () => null,
   // 用户点了提问卡片的选项：({ id, index, option }) => { ok, answer }。
   onQuestionPick = () => ({ ok: false }),
+  // 用户点了建议卡片的编号：({ id, n }) => { ok, text } 或 { ok: false, error }。
+  onSuggestionPick = () => ({ ok: false }),
   onChatId = () => {},
   initialChatId = '',
   log = console,
@@ -184,6 +203,7 @@ export function createWecomAdapter({
   const taskPrefix = `ccim_${Math.random().toString(36).slice(2, 10)}`
   const cards = new Map() // 审批编号 -> 发出时的卡片内容，用于点按钮后更新
   const questionCards = new Map() // `${id}:${index}` -> 发出时的提问卡片内容
+  const suggestionCards = new Map() // 建议组 id -> 发出时的内容
   let sessionCardSeq = 0
 
   const reqId = prefix => `${prefix}_${Date.now()}_${++seq}`
@@ -262,7 +282,9 @@ export function createWecomAdapter({
     const taskId = detail.task_id ?? body.event?.task_id
     const useMatch = SESSION_KEY.exec(eventKey ?? '')
     if (useMatch) return handleSessionPick(frame, useMatch[1], Number(useMatch[2]), taskId)
-    if (/^q:\d+:\d+:done$/.test(eventKey ?? '')) return
+    if (/^(q:\d+:\d+|sug:\d+):done$/.test(eventKey ?? '')) return
+    const sugMatch = SUGGESTION_KEY.exec(eventKey ?? '')
+    if (sugMatch) return handleSuggestionPick(frame, Number(sugMatch[1]), Number(sugMatch[2]), taskId)
     const qMatch = QUESTION_KEY.exec(eventKey ?? '')
     if (qMatch) return handleQuestionPick(frame, Number(qMatch[1]), Number(qMatch[2]), Number(qMatch[3]), taskId)
     const action = parseCardKey(eventKey)
@@ -314,6 +336,23 @@ export function createWecomAdapter({
       const done = mode === 'away' ? `正在遥控 ${picked?.name ?? num}` : `之后的消息发给 ${picked?.name ?? num}`
       send(done).catch(e => log.warn(`企微：${e.message}`))
     })
+  }
+
+  function handleSuggestionPick(frame, id, n, taskId) {
+    const sent = suggestionCards.get(id)
+    if (!sent || taskId !== `${taskPrefix}_g${id}`) {
+      send('这组建议已过期，发「建议」重新生成').catch(err => log.warn(`企微：${err.message}`))
+      return
+    }
+    const r = onSuggestionPick({ id, n })
+    if (!r.ok) {
+      send(r.error ?? '发送失败').catch(err => log.warn(`企微：${err.message}`))
+      return
+    }
+    writeAndWait('aibot_respond_update_msg', frame.headers?.req_id, {
+      response_type: 'update_template_card',
+      template_card: suggestionsCard(sent, taskPrefix, `${n}. ${r.text}`),
+    }).catch(err => log.warn(`企微：更新建议卡片失败：${err.message}`))
   }
 
   function handleQuestionPick(frame, id, index, option, taskId) {
@@ -563,6 +602,26 @@ export function createWecomAdapter({
     return streamFinal(stream, text, fallbackText)
   }
 
+  function sendSuggestionsCard(sug, fallbackText) {
+    const run = sendChain.then(async () => {
+      if (!chatId) throw new Error('还不知道发给谁：先在企微里给机器人发一条消息')
+      suggestionCards.set(sug.id, sug)
+      if (suggestionCards.size > DEDUP_SIZE) suggestionCards.delete(suggestionCards.keys().next().value)
+      try {
+        await writeAndWait('aibot_send_msg', reqId('aibot_send_msg'), {
+          chatid: chatId,
+          msgtype: 'template_card',
+          template_card: suggestionsCard(sug, taskPrefix),
+        })
+      } catch (err) {
+        log.warn(`企微：建议卡片发送失败，改发文字：${err.message}`)
+        for (const chunk of splitByBytes(fallbackText)) await sendChunk(chatId, chunk)
+      }
+    })
+    sendChain = run.catch(() => {})
+    return run
+  }
+
   function sendSessionsCard(rows, fallbackText, mode = 'use') {
     const run = sendChain.then(async () => {
       if (!chatId) throw new Error('还不知道发给谁：先在企微里给机器人发一条消息')
@@ -596,6 +655,7 @@ export function createWecomAdapter({
     sendApprovalCard,
     sendSessionsCard,
     sendQuestionCard,
+    sendSuggestionsCard,
     sendStream,
     get isConnected() {
       return isAuthenticated

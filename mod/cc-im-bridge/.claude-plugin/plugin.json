@@ -1,1 +1,1 @@
-{ "name": "cc-im-bridge", "version": "0.5.2", "description": "把本会话接到本地 IM 中转：收 IM 消息进会话，回复发回 IM" }
+{ "name": "cc-im-bridge", "version": "0.6.0", "description": "把本会话接到本地 IM 中转：收 IM 消息进会话，回复发回 IM" }

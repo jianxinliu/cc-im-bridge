@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { approvalCard, createWecomAdapter, questionCard, sessionsCard, extractText, formatOutgoing, loadWecomConfig, parseCardKey, splitByBytes } from '../relay/wecom.mjs'
+import { approvalCard, createWecomAdapter, questionCard, sessionsCard, suggestionsCard, extractText, formatOutgoing, loadWecomConfig, parseCardKey, splitByBytes } from '../relay/wecom.mjs'
 
 // 假 WebSocket：记录发出的帧，测试用 serverSays 模拟服务端下发。
 function fakeSocketFactory() {
@@ -665,4 +665,30 @@ test('遥控卡片：按钮 key 为 away:编号，标出遥控中的会话；点
   socket().serverSays(cardEvent('alice', 'away:1', {}, taskId))
   assert.deepEqual(picks, [1])
   assert.equal(socket().lastSent().body.template_card.main_title.desc, '遥控中：1. api')
+})
+
+test('建议卡片：正文列建议、按钮放编号；点了发送并更新成已发送；过期卡片不生效', async () => {
+  const sug = { id: 4, name: 'api', items: ['跑测试', '提交'] }
+  const card = suggestionsCard(sug, 'p')
+  assert.deepEqual([card.main_title.title, card.sub_title_text, card.task_id], ['api 接下来可以', '1. 跑测试\n2. 提交', 'p_g4'])
+  assert.deepEqual(card.button_list.map(b => b.key), ['sug:4:1', 'sug:4:2'])
+
+  const picks = []
+  const { socket, authOk, adapter } = setup({ onSuggestionPick: p => (picks.push(p), { ok: true, text: '提交' }) })
+  authOk()
+  socket().serverSays(textFrame('alice', 'hi'))
+  const sending = adapter.sendSuggestionsCard(sug, 'x')
+  await tick()
+  const taskId = socket().lastSent().body.template_card.task_id
+  ackLast(socket())
+  await sending
+
+  socket().serverSays(cardEvent('alice', 'sug:4:2', {}, 'ccim_old_g4'))
+  await tick()
+  assert.deepEqual(picks, [])
+  ackLast(socket())
+  const evt = cardEvent('alice', 'sug:4:2', {}, taskId)
+  socket().serverSays(evt)
+  assert.deepEqual(picks, [{ id: 4, n: 2 }])
+  assert.equal(socket().lastSent().body.template_card.main_title.desc, '已发送：2. 提交')
 })
