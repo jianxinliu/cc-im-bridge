@@ -6,5 +6,5 @@
     "relay": "node relay/relay.mjs",
     "test": "node --test test/*.test.mjs && claude plugin test mod/cc-im-bridge"
   },
-  "version": "0.4.1"
+  "version": "0.5.0"
 }

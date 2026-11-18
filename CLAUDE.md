@@ -7,6 +7,7 @@
 - `relay/core.mjs`：路由与审批的纯逻辑（无 I/O，注入 `now`），绝大多数行为在这里测。
 - `relay/relay.mjs`：中转进程，Unix socket（给 mod 和钩子）+ 127.0.0.1 网页窗口 + 企微适配器的装配。
 - `relay/wecom.mjs`：企微智能机器人长连接适配器；`relay/ws-client.mjs`：自写 WebSocket 客户端。
+- `relay/titles.mjs`：从 `~/.claude/projects/*/<会话 id>.jsonl` 读最新的 `custom-title` 作为企微里的会话名（Desktop 侧边栏标题；每轮都会重写一次）。只读这一行，按修改时间缓存。
 - `relay/summary.mjs`：审批摘要。**mod 的 `hooks/register.ts` 里有一份相同实现**，两边必须一致（mod 按摘要作废「已在电脑上处理」的审批），改一边要同步另一边。
 - `hooks/permission-request.mjs`：settings 的 PermissionRequest 钩子。
 - `mod/cc-im-bridge/`：会话插件（engine 的 hooks 模块）。用户级安装时直接读这个目录。

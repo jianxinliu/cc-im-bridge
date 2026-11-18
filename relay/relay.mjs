@@ -9,6 +9,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { createRelay } from './core.mjs'
+import { createTitleReader } from './titles.mjs'
 import { createWecomAdapter, formatOutgoing, loadWecomConfig } from './wecom.mjs'
 import { MiniWebSocket } from './ws-client.mjs'
 
@@ -18,7 +19,17 @@ const WEB_PORT = Number(process.env.CC_IM_WEB_PORT ?? 8788)
 const MAX_BODY = 1 << 20
 const PAGE = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'web.html'), 'utf8')
 
-const relay = createRelay()
+const readTitle = createTitleReader()
+const relay = createRelay({
+  titleOf: sessionId => {
+    try {
+      return readTitle(sessionId)
+    } catch (err) {
+      console.warn(`读会话 ${sessionId} 的标题失败，改用插件登记的名字：${err.message}`)
+      return undefined
+    }
+  },
+})
 
 function readJson(req) {
   return new Promise((resolve, reject) => {

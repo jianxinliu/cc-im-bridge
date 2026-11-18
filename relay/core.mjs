@@ -11,9 +11,10 @@ export const STATUS_TEXT = { pending: '待批', approved: '已批准', denied: '
 const APPROVE_WORDS = new Set(['好', '好的', '好啊', '可以', '行', '批准', '同意', '确认', 'ok'])
 const DENY_WORDS = ['不行', '不可以', '不要', '不用', '拒绝', '不同意', '先别', '别', '不', 'no', 'n']
 const LIST_PHRASES = new Set(['/list', '/ls', '会话', '会话列表', '有哪些会话', '列一下会话', '列出会话', '看看会话'])
-const USE_PATTERN = /^(?:\/use|切到|切换到|换到)\s*(\S+)$/
+const USE_PATTERN = /^(?:\/use|切到|切换到|换到)\s*(.+)$/
 
-export function createRelay({ now = () => Date.now() } = {}) {
+// titleOf(sessionId)：会话在 Desktop 侧边栏上的标题（读不到返回 undefined），企微里优先用它显示和匹配。
+export function createRelay({ now = () => Date.now(), titleOf = () => undefined } = {}) {
   const sessions = new Map() // sessionId -> { sessionId, name, cwd, lastSeen, queue: [] }
   const log = [] // 发往 IM 的消息与收到的 IM 消息，供 IM 适配器按序号拉取
   let seq = 0
@@ -25,6 +26,16 @@ export function createRelay({ now = () => Date.now() } = {}) {
 
   const isOnline = s => now() - s.lastSeen <= ONLINE_WINDOW_MS
   const byName = name => [...sessions.values()].find(s => s.name === name)
+
+  // 企微里显示的名字：侧边栏标题，读不到时用插件登记的名字。
+  function label(s) {
+    try {
+      return titleOf(s.sessionId) || s.name
+    } catch {
+      return s.name
+    }
+  }
+  const namesOf = s => [label(s), s.name].map(n => n.toLowerCase())
 
   // 每个会话一个在登记期间不变的小编号，IM 里可以用 @2、/use 2 指代。
   function freeNumber() {
@@ -41,13 +52,13 @@ export function createRelay({ now = () => Date.now() } = {}) {
       const s = all.find(x => x.num === Number(ref))
       return s ? { session: s } : { error: `没有编号 ${ref} 的会话，发 /list 查看` }
     }
-    const exact = byName(ref)
-    if (exact) return { session: exact }
-    const lower = ref.toLowerCase()
-    const matches = all.filter(x => x.name.toLowerCase().startsWith(lower))
+    const lower = ref.trim().toLowerCase()
+    const exact = all.filter(x => namesOf(x).includes(lower))
+    if (exact.length === 1) return { session: exact[0] }
+    const matches = exact.length > 1 ? exact : all.filter(x => namesOf(x).some(n => n.startsWith(lower)))
     if (matches.length === 1) return { session: matches[0] }
     if (matches.length > 1) {
-      return { error: `${ref} 能匹配多个会话：${matches.map(x => `${x.num}.${x.name}`).join('、')}，用编号或写长一点` }
+      return { error: `${ref} 能匹配多个会话：${matches.map(x => `${x.num}.${label(x)}`).join('、')}，用编号或写长一点` }
     }
     return { error: `没有名为 ${ref} 的会话，发 /list 查看` }
   }
@@ -108,7 +119,7 @@ export function createRelay({ now = () => Date.now() } = {}) {
     if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
     if (!text?.trim()) return { ok: false, status: 400, error: 'text 为空' }
     s.lastSeen = now()
-    pushLog({ dir: 'out', from: s.name, text })
+    pushLog({ dir: 'out', from: label(s), text })
     return { ok: true }
   }
 
@@ -117,7 +128,8 @@ export function createRelay({ now = () => Date.now() } = {}) {
       .sort((a, b) => a.num - b.num)
       .map(s => ({
       num: s.num,
-      name: s.name,
+      name: label(s),
+      alias: s.name,
       cwd: s.cwd,
       version: s.version,
       online: isOnline(s),
@@ -128,12 +140,12 @@ export function createRelay({ now = () => Date.now() } = {}) {
 
   function deliver(s, text) {
     if (s.queue.length >= MAX_QUEUE) {
-      tell(`${s.name} 的待投递消息已满 ${MAX_QUEUE} 条，本条未投递`)
+      tell(`${label(s)} 的待投递消息已满 ${MAX_QUEUE} 条，本条未投递`)
       return
     }
     s.queue.push({ id: `m${seq + 1}`, text, ts: now() })
     target = s.sessionId
-    tell(isOnline(s) ? `→ ${s.name}` : `→ ${s.name}（会话离线，已排队，上线后投递）`)
+    tell(isOnline(s) ? `→ ${label(s)}` : `→ ${label(s)}（会话离线，已排队，上线后投递）`)
   }
 
   // IM 侧发来的一条消息：命令、@指定会话，或发给当前会话。
@@ -184,10 +196,10 @@ export function createRelay({ now = () => Date.now() } = {}) {
 
     // 「api：跑一下测试」：冒号前是某个会话的完整名字或编号时，发给它；
     // 只认完整名字，避免「注意：xxx」这类普通句子被误当成会话名。
-    const named = text.match(/^([^\s:：]{1,32})\s*[：:]\s*([\s\S]+)$/)
+    const named = text.match(/^([^:：\n]{1,40}?)\s*[：:]\s*([\s\S]+)$/)
     if (named) {
-      const key = named[1].toLowerCase()
-      const s = [...sessions.values()].find(x => x.name.toLowerCase() === key || String(x.num) === key)
+      const key = named[1].trim().toLowerCase()
+      const s = [...sessions.values()].find(x => namesOf(x).includes(key) || String(x.num) === key)
       if (s) return deliver(s, named[2])
     }
 
@@ -205,7 +217,7 @@ export function createRelay({ now = () => Date.now() } = {}) {
     const { session: s, error } = resolve(String(ref))
     if (!s) return { ok: false, error }
     target = s.sessionId
-    return { ok: true, name: s.name, num: s.num }
+    return { ok: true, name: label(s), num: s.num }
   }
 
   const since = n => log.filter(e => e.seq > n)
@@ -230,14 +242,14 @@ export function createRelay({ now = () => Date.now() } = {}) {
     if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
     if (!tool) return { ok: false, status: 400, error: 'tool 必填' }
     expireOld()
-    const a = { id: ++approvalSeq, sessionId, name: s.name, tool, summary: summary ?? '', status: 'pending', reason: '', createdAt: now() }
+    const a = { id: ++approvalSeq, sessionId, name: label(s), tool, summary: summary ?? '', status: 'pending', reason: '', createdAt: now() }
     approvals.set(a.id, a)
     pushLog({
       dir: 'out',
-      from: s.name,
+      from: a.name,
       text: `请求批准 #${a.id}：${tool}\n${a.summary}\n回复「好」批准，「不行」拒绝`.replace(/\n\n/g, '\n'),
       // IM 适配器据此画成带按钮的卡片；网页窗口仍显示 text。
-      approval: { id: a.id, name: s.name, tool, summary: a.summary },
+      approval: { id: a.id, name: a.name, tool, summary: a.summary },
     })
     return { ok: true, id: a.id }
   }

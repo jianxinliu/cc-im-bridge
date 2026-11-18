@@ -338,3 +338,46 @@ test('useSession：按编号切换并返回名字；不存在时报错', () => {
   assert.equal(relay.list()[0].current, true)
   assert.equal(relay.useSession(9).ok, false)
 })
+
+test('有侧边栏标题时：列表、投递回执、回复、审批都显示标题；按标题或原名都能找到', () => {
+  const titles = { s1: 'cc-im-bridge 开发', s2: '判例整理与模型适用说明' }
+  let t = 1_000_000
+  const relay = createRelay({ now: () => t, titleOf: id => titles[id] })
+  const lastReply = () => relay.since(0).at(-1)
+  relay.register({ sessionId: 's1', name: 'cc-im-bridge', cwd: '' })
+  relay.register({ sessionId: 's2', name: 'tpa', cwd: '' })
+  relay.register({ sessionId: 's3', name: 'plain', cwd: '' })
+
+  assert.deepEqual(relay.list().map(r => [r.num, r.name, r.alias]), [
+    [1, 'cc-im-bridge 开发', 'cc-im-bridge'],
+    [2, '判例整理与模型适用说明', 'tpa'],
+    [3, 'plain', 'plain'],
+  ])
+
+  relay.handleIncoming('切到 判例')
+  assert.equal(lastReply().text, '之后的消息发给 判例整理与模型适用说明')
+  relay.handleIncoming('cc-im-bridge 开发：带空格的标题也能用冒号发')
+  assert.equal(lastReply().text, '→ cc-im-bridge 开发')
+  relay.handleIncoming('tpa：原名也行')
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['带空格的标题也能用冒号发'])
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).messages.map(m => m.text), ['原名也行'])
+
+  relay.reply({ sessionId: 's2', text: '完成' })
+  assert.equal(lastReply().from, '判例整理与模型适用说明')
+  relay.requestApproval({ sessionId: 's1', tool: 'Bash', summary: 'ls' })
+  assert.equal(lastReply().approval.name, 'cc-im-bridge 开发')
+})
+
+test('标题读取出错时退回插件登记的名字', () => {
+  const relay = createRelay({ titleOf: () => { throw new Error('EACCES') } })
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  assert.equal(relay.list()[0].name, 'api')
+})
+
+test('前缀同时命中多个标题时列出候选', () => {
+  const relay = createRelay({ titleOf: id => ({ s1: 'tpa 发布验证', s2: 'tpa 判例整理' })[id] })
+  relay.register({ sessionId: 's1', name: 'a', cwd: '' })
+  relay.register({ sessionId: 's2', name: 'b', cwd: '' })
+  relay.handleIncoming('切到 tpa')
+  assert.match(relay.since(0).at(-1).text, /tpa 能匹配多个会话：1\.tpa 发布验证、2\.tpa 判例整理/)
+})
