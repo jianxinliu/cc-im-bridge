@@ -55,14 +55,15 @@ export function sessionsCard(rows, taskId) {
   return {
     card_type: 'button_interaction',
     source: { desc: 'cc-im-bridge' },
-    main_title: { title: '选择会话', desc: current ? `当前：${current.name}` : '点一个，之后的消息发给它' },
+    main_title: { title: '选择会话', desc: current ? `当前：${current.num}. ${current.name}` : '点编号，之后的消息发给它' },
     sub_title_text:
       rows.map(r => `${r.num}. ${r.name}${r.online ? '' : '（离线）'}`).join('\n') +
       (extra > 0 ? `\n还有 ${extra} 个，说「切到 名字」` : ''),
     card_action: { type: 0 },
     task_id: taskId,
+    // 一行三个按钮时只显示得下三四个字符，名字会被截断；按钮只放编号，名字在上面的列表里。
     button_list: shown.map(r => ({
-      text: `${r.current ? '✓ ' : ''}${r.name}`.slice(0, 10),
+      text: `${r.current ? '✓ ' : ''}${r.num}`,
       style: r.current ? 1 : 2,
       key: `use:${r.num}`,
     })),

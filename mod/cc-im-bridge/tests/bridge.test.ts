@@ -1,6 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, On } from 'claude-code/testing'
 
+import { defaultName } from '../hooks/register'
+
 type Call = { path: string; body: Record<string, unknown> }
 
 // 中转的替身：记下每次请求，按路径给出答复。
@@ -17,10 +19,11 @@ function fakeRelay(on: On, answers: Record<string, (body: Record<string, unknown
   return calls
 }
 
-function engineBeneath(on: On, sessionId = 'abcd1234-session') {
+function engineBeneath(on: On, sessionId = 'abcd1234-session', repoRoot: string | null = null) {
   const submitted: string[] = []
   const statuses: (string | undefined)[] = []
   on('session.id', () => ({ value: sessionId }))
+  on('session.repo', () => ({ value: repoRoot ? { root: repoRoot, remote: null, internal: false, name: null } : null }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('tool.register', () => ({ value: {} }))
@@ -59,7 +62,7 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.3.0' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.3.1' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
@@ -220,4 +223,19 @@ test('审批转发：工具开始运行时，按工具和摘要作废 IM 里那�
   await clock.settle()
   const settles = calls.filter(c => c.path === '/mod/approval/settle-local')
   expect(settles.length).toBe(1)
+})
+
+test('默认名字：普通目录取目录名；worktree 取「仓库名-worktree 名第一段」', () => {
+  expect(defaultName('/w/api', '/w/api')).toBe('api')
+  expect(defaultName('/w/api', undefined)).toBe('api')
+  expect(defaultName('/w/tpa/.claude/worktrees/musing-meitner-591696', '/w/tpa')).toBe('tpa-musing')
+  expect(defaultName('/', undefined)).toBe('session')
+})
+
+test('worktree 会话登记时用仓库名命名', async ($, on) => {
+  const calls = fakeRelay(on, { '/mod/poll': () => ({ ok: true, messages: [] }) })
+  const { clock } = engineBeneath(on, 'abcd1234-session', '/Users/me/work')
+  await $.session.start({ cwd: '/Users/me/work/.claude/worktrees/brave-noether-1a2b', surface: 'desktop', isInteractive: true })
+  await clock.advance(2000)
+  expect(calls[0]?.body.name).toBe('work-brave')
 })

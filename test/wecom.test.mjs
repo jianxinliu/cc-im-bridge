@@ -470,12 +470,12 @@ const rows = [
   { num: 2, name: 'web-frontend-long-name', cwd: '/w/web', online: false, current: true },
 ]
 
-test('会话卡片：每个会话一个按钮，当前会话标 ✓，按钮文字不超 10 字，最多 6 个', () => {
+test('会话卡片：按钮只放编号（名字太长会被截断），当前会话标 ✓，最多 6 个', () => {
   const card = sessionsCard(rows, 'p_s1')
   assert.equal(card.card_type, 'button_interaction')
-  assert.equal(card.main_title.desc, '当前：web-frontend-long-name')
+  assert.equal(card.main_title.desc, '当前：2. web-frontend-long-name')
   assert.equal(card.sub_title_text, '1. api\n2. web-frontend-long-name（离线）')
-  assert.deepEqual(card.button_list.map(b => [b.text, b.key, b.style]), [['api', 'use:1', 2], ['✓ web-fron', 'use:2', 1]])
+  assert.deepEqual(card.button_list.map(b => [b.text, b.key, b.style]), [['1', 'use:1', 2], ['✓ 2', 'use:2', 1]])
   const many = Array.from({ length: 8 }, (_, i) => ({ num: i + 1, name: `s${i + 1}`, cwd: '', online: true, current: false }))
   const big = sessionsCard(many, 'p_s2')
   assert.equal(big.button_list.length, 6)
@@ -501,7 +501,7 @@ test('点会话按钮：切换会话，并用事件 req_id 把卡片重画成新
   const update = socket().lastSent()
   assert.equal(update.cmd, 'aibot_respond_update_msg')
   assert.equal(update.headers.req_id, evt.headers.req_id)
-  assert.equal(update.body.template_card.main_title.desc, '当前：api')
+  assert.equal(update.body.template_card.main_title.desc, '当前：1. api')
   assert.equal(update.body.template_card.task_id, taskId)
 })
 

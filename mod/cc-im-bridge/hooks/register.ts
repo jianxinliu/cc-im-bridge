@@ -1,7 +1,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
-const VERSION = '0.3.0'
+const VERSION = '0.3.1'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
 const NAME_PATTERN = /^[\w.\-一-龥]{1,32}$/
@@ -134,13 +134,25 @@ async function setPushMode($: EngineInterface, wanted: string) {
   return `回传模式改为 ${wanted}`
 }
 
+const lastSegment = (path: string) => path.split('/').filter(Boolean).pop() ?? ''
+
+// 默认名字取目录名。worktree 的目录名是随机生成的（如 musing-meitner-591696），
+// 看不出属于哪个项目，改成「仓库名-worktree 名第一段」。
+export function defaultName(cwd: string, repoRoot: string | undefined) {
+  const dir = lastSegment(cwd) || 'session'
+  if (!repoRoot || repoRoot === cwd) return dir
+  const repo = lastSegment(repoRoot)
+  return repo ? `${repo}-${dir.split('-')[0]}` : dir
+}
+
 async function start($: EngineInterface, cwd: string) {
   const home = await $.env.get('HOME')
   bridge.socketPath = `${home}/.cc-im-bridge/relay.sock`
   bridge.sessionId = await $.session.id()
   bridge.cwd = cwd
   const storedName = await $.store.get(`name:${bridge.sessionId}`)
-  bridge.name = String(storedName ?? cwd.split('/').filter(Boolean).pop() ?? 'session')
+  const repo = storedName === undefined ? await $.session.repo() : null
+  bridge.name = String(storedName ?? defaultName(cwd, repo?.root))
   const storedMode = await $.store.get(`push:${bridge.sessionId}`)
   bridge.pushMode = storedMode === 'all' || storedMode === 'off' ? storedMode : 'im'
   bridge.isAway = (await $.store.get(`away:${bridge.sessionId}`)) === true
