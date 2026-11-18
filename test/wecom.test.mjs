@@ -468,14 +468,14 @@ test('卡片点击：旧版 SDK 写法（key 直接在 event 下）也能识别'
 
 const rows = [
   { num: 1, name: 'api', cwd: '/w/api', online: true, current: false },
-  { num: 2, name: 'web-frontend-long-name', cwd: '/w/web', online: false, current: true },
+  { num: 2, name: 'web-frontend-long-name', cwd: '/w/web', online: false, current: true, away: true },
 ]
 
 test('会话卡片：按钮只放编号（名字太长会被截断），当前会话标 ✓，最多 6 个', () => {
   const card = sessionsCard(rows, 'p_s1')
   assert.equal(card.card_type, 'button_interaction')
   assert.equal(card.main_title.desc, '当前：2. web-frontend-long-name')
-  assert.equal(card.sub_title_text, '1. api\n2. web-frontend-long-name（离线）')
+  assert.equal(card.sub_title_text, '1. api\n2. web-frontend-long-name（离线）（遥控中）')
   assert.deepEqual(card.button_list.map(b => [b.text, b.key, b.style]), [['1', 'use:1', 2], ['✓ 2', 'use:2', 1]])
   const many = Array.from({ length: 8 }, (_, i) => ({ num: i + 1, name: `s${i + 1}`, cwd: '', online: true, current: false }))
   const big = sessionsCard(many, 'p_s2')

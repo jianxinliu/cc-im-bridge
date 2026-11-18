@@ -1,7 +1,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
-const VERSION = '0.5.0'
+const VERSION = '0.5.1'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
 const NAME_PATTERN = /^[\w.\-一-龥]{1,32}$/
@@ -87,7 +87,7 @@ async function tick($: EngineInterface) {
   bridge.isPolling = true
   try {
     if (!bridge.isRegistered) await ensureRegistered($)
-    const r = await call($, '/mod/poll', { sessionId: bridge.sessionId, forward: shouldForward() })
+    const r = await call($, '/mod/poll', { sessionId: bridge.sessionId, forward: shouldForward(), away: bridge.isAway })
     if (r.status === 404) {
       // 中转重启后登记表清空，下一轮重新登记。
       bridge.isRegistered = false

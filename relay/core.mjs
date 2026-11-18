@@ -21,12 +21,14 @@ const HELP_TEXT = [
   '切到 名字：之后发给它',
   '名字：内容：只发这一条',
   '停：中断当前这一轮',
-  '离开 / 回来了：开关离开模式',
+  '离开：当前会话进入遥控（离开 2：指定会话）',
+  '回来了：所有会话退出遥控',
   '好 / 不行，原因：批准或拒绝',
   '/pending：查看待批',
 ].join('\n')
 const STOP_PHRASES = new Set(['停', '停止', '停下', '中断', '别做了', 'stop'])
-const AWAY_PHRASES = new Set(['离开', '我走了', '我离开了', '离开模式', '出门了'])
+const AWAY_PHRASES = new Set(['离开', '我走了', '我离开了', '离开模式', '出门了', '遥控'])
+const AWAY_WITH_TARGET = /^(?:离开|遥控)\s+(.+)$/
 const BACK_PHRASES = new Set(['回来了', '我回来了', '回来', '关闭离开模式'])
 const USE_PATTERN = /^(?:\/use|切到|切换到|换到)\s*(.+)$/
 
@@ -121,6 +123,8 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
       // 给会话插件的控制指令（中断、开关离开模式），随取信一起拿走。
       controls: existing?.controls ?? [],
       forward: existing?.forward ?? false,
+      // 会话插件上报的离开模式状态，用于在会话列表上标「遥控中」。
+      away: existing?.away ?? false,
     })
     return { ok: true, name }
   }
@@ -134,11 +138,12 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
   }
 
   // 会话取信，同时上报「需要批准时是否转到 IM」（IM 发起的回合或离开模式下为 true）。
-  function poll({ sessionId, forward }) {
+  function poll({ sessionId, forward, away }) {
     const s = sessions.get(sessionId)
     if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
     s.lastSeen = now()
     if (typeof forward === 'boolean') s.forward = forward
+    if (typeof away === 'boolean') s.away = away
     const messages = s.queue.splice(0)
     const controls = s.controls.splice(0)
     return { ok: true, messages, controls }
@@ -177,6 +182,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
       online: isOnline(s),
       queued: s.queue.length,
       current: s.sessionId === target,
+      away: s.away,
     }))
   }
 
@@ -206,7 +212,7 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
       pushLog({
         dir: 'out',
         from: 'relay',
-        text: rows.map(r => `${r.current ? '*' : ' '} ${r.num}. ${r.name}${r.online ? '' : '（离线）'}  ${r.cwd}`).join('\n'),
+        text: rows.map(r => `${r.current ? '*' : ' '} ${r.num}. ${r.name}${r.online ? '' : '（离线）'}${r.away ? '（遥控中）' : ''}  ${r.cwd}`).join('\n'),
         // IM 适配器据此画成每个会话一个按钮的卡片。
         sessions: rows,
       })
@@ -233,17 +239,33 @@ export function createRelay({ now = () => Date.now(), titleOf = () => undefined,
       return tell(`已让 ${label(s)} 停下当前这一轮`)
     }
 
-    // 离开 / 回来对所有在线会话生效：人离开电脑，哪个会话要找你都该找得到。
-    if (AWAY_PHRASES.has(text) || BACK_PHRASES.has(text)) {
-      const on = AWAY_PHRASES.has(text)
-      const online = [...sessions.values()].filter(isOnline)
-      if (online.length === 0) return tell('没有在线的会话')
-      for (const s of online) s.controls.push({ type: 'away', on })
-      return tell(
-        on
-          ? `已为 ${online.length} 个会话打开离开模式：回复、审批、提问都会发到这里`
-          : `已为 ${online.length} 个会话关闭离开模式`,
-      )
+    // 离开模式只开给一个会话：当前会话，或「离开 2」「离开 名字」指定的那个（并切过去）。
+    // 一次全开会让所有会话的回复都涌进来。
+    const awayTarget = text.match(AWAY_WITH_TARGET)
+    if (AWAY_PHRASES.has(text) || awayTarget) {
+      let s
+      if (awayTarget) {
+        const found = resolve(awayTarget[1])
+        if (!found.session) return tell(found.error)
+        s = found.session
+        setTarget(s.sessionId)
+      } else {
+        s = currentSession()
+        if (!s) return tell('先选一个会话：发「会话」点选，或说「离开 编号」')
+      }
+      s.controls.push({ type: 'away', on: true })
+      s.away = true
+      return tell(`已为 ${label(s)} 打开离开模式：它每一轮的回复、审批、提问都会发到这里。回到电脑说「回来了」`)
+    }
+
+    // 回到电脑前：所有会话都恢复原样。
+    if (BACK_PHRASES.has(text)) {
+      const remote = [...sessions.values()].filter(s => s.away)
+      for (const s of sessions.values()) {
+        s.controls.push({ type: 'away', on: false })
+        s.away = false
+      }
+      return tell(remote.length ? `已关闭离开模式：${remote.map(label).join('、')}` : '没有开着离开模式的会话')
     }
 
     if (text === '/pending') {

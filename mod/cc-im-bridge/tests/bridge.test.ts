@@ -62,7 +62,7 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.5.0' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.5.1' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
@@ -304,4 +304,15 @@ test('流式进度：IM 消息带 id 提交；该回合每个工具报一行进�
   await $.tool.call({ tool: 'Bash', command: 'ls' })
   await clock.settle()
   expect(calls.filter(c => c.path === '/mod/progress').length).toBe(1)
+})
+
+test('取信时上报是否在离开模式，供企微会话列表标「遥控中」', async ($, on) => {
+  const calls = fakeRelay(on, { '/mod/poll': () => ({ ok: true, messages: [] }) })
+  const { clock } = engineBeneath(on)
+  await startSession($)
+  await clock.advance(2000)
+  expect(calls.filter(c => c.path === '/mod/poll').at(-1)?.body.away).toBe(false)
+  await $.command.run({ command: 'im-away', args: 'on' })
+  await clock.advance(2000)
+  expect(calls.filter(c => c.path === '/mod/poll').at(-1)?.body.away).toBe(true)
 })

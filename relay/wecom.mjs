@@ -89,7 +89,7 @@ export function sessionsCard(rows, taskId) {
     source: { desc: 'cc-im-bridge' },
     main_title: { title: '选择会话', desc: current ? `当前：${current.num}. ${current.name}` : '点编号，之后的消息发给它' },
     sub_title_text:
-      rows.map(r => `${r.num}. ${r.name}${r.online ? '' : '（离线）'}`).join('\n') +
+      rows.map(r => `${r.num}. ${r.name}${r.online ? '' : '（离线）'}${r.away ? '（遥控中）' : ''}`).join('\n') +
       (extra > 0 ? `\n还有 ${extra} 个，说「切到 名字」` : ''),
     card_action: { type: 0 },
     task_id: taskId,

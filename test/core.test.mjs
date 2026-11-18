@@ -425,20 +425,43 @@ test('「停」给当前会话下发中断；没有当前会话时提示选择',
   assert.deepEqual(relay.poll({ sessionId: 's1' }).controls, [])
 })
 
-test('「离开」「回来了」对所有在线会话下发，离线会话不发', () => {
-  const { relay, clock, lastReply } = setup()
-  relay.register({ sessionId: 'old', name: 'old', cwd: '' })
-  clock.advance(ONLINE_WINDOW_MS + 1)
+test('「离开」只对当前会话；「离开 编号/名字」指定会话并切过去；没选会话时提示', () => {
+  const { relay, lastReply } = setup()
   relay.register({ sessionId: 's1', name: 'api', cwd: '' })
   relay.register({ sessionId: 's2', name: 'web', cwd: '' })
   relay.handleIncoming('离开')
-  assert.match(lastReply(), /已为 2 个会话打开离开模式/)
+  assert.match(lastReply(), /先选一个会话/)
+
+  relay.handleIncoming('切到 web')
+  relay.handleIncoming('离开')
+  assert.match(lastReply(), /已为 web 打开离开模式/)
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).controls, [{ type: 'away', on: true }])
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).controls, [], '别的会话不受影响')
+
+  relay.handleIncoming('离开 1')
+  assert.match(lastReply(), /已为 api 打开离开模式/)
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).controls, [{ type: 'away', on: true }])
+  relay.handleIncoming('继续')
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['继续'], '「离开 1」顺带切到 1')
+  relay.handleIncoming('离开 nope')
+  assert.match(lastReply(), /没有名为 nope 的会话/)
+})
+
+test('会话列表标出遥控中的会话（以插件上报为准）；「回来了」关闭所有会话的离开模式', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '/w/api' })
+  relay.register({ sessionId: 's2', name: 'web', cwd: '/w/web' })
+  relay.poll({ sessionId: 's1', away: true })
+  relay.handleIncoming('会话')
+  assert.deepEqual(relay.since(0).at(-1).sessions.map(r => [r.name, r.away]), [['api', true], ['web', false]])
+  assert.match(lastReply(), /1\. api（遥控中）/)
+
   relay.handleIncoming('回来了')
-  for (const id of ['s1', 's2']) {
-    assert.deepEqual(relay.poll({ sessionId: id }).controls, [{ type: 'away', on: true }, { type: 'away', on: false }])
-  }
-  assert.deepEqual(relay.poll({ sessionId: 'old' }).controls, [])
-  assert.equal(relay.poll({ sessionId: 's1' }).messages.length, 0, '「离开」不会被当成普通消息发给会话')
+  assert.equal(lastReply(), '已关闭离开模式：api')
+  for (const id of ['s1', 's2']) assert.deepEqual(relay.poll({ sessionId: id }).controls, [{ type: 'away', on: false }])
+  assert.equal(relay.list().some(r => r.away), false)
+  relay.handleIncoming('回来了')
+  assert.equal(lastReply(), '没有开着离开模式的会话')
 })
 
 const ask = [
