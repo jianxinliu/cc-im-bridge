@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine, On } from 'claude-code/testing'
 
-import { defaultName, isTypedAtComputer, normalizeName, parseSuggestions } from '../hooks/register'
+import { defaultName, isTypedAtComputer, normalizeName, parseSuggestions, sendTextRefusal } from '../hooks/register'
 
 type Call = { path: string; body: Record<string, unknown> }
 
@@ -64,7 +64,7 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.7.3' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.7.4' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
@@ -443,4 +443,38 @@ test('/im-push off 时，IM 发起的回合仍给那条消息收尾（不发回�
   await $.turn.start({ text: '本地', turnId: 't2' })
   await $.turn.complete({ answer: '本地回复', durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' })
   expect(calls.filter(c => c.path === '/mod/reply').length).toBe(1)
+})
+
+test('send 只发文字：IM 发起的回合里拒绝；人在电脑前且没开离开模式时拒绝；其余照发', () => {
+  expect(sendTextRefusal({ isImTurn: true, isAway: false, lastPromptFrom: 'im' })).toContain('自动发回')
+  expect(sendTextRefusal({ isImTurn: true, isAway: true, lastPromptFrom: 'im' })).toContain('自动发回')
+  expect(sendTextRefusal({ isImTurn: false, isAway: false, lastPromptFrom: 'computer' })).toContain('人在电脑前')
+  expect(sendTextRefusal({ isImTurn: false, isAway: true, lastPromptFrom: 'computer' })).toBeUndefined()
+  expect(sendTextRefusal({ isImTurn: false, isAway: false, lastPromptFrom: 'im' })).toBeUndefined()
+  expect(sendTextRefusal({ isImTurn: false, isAway: false, lastPromptFrom: '' })).toBeUndefined()
+})
+
+test('IM 发起的回合里 send 只发文字被拒（回复会自动发回）；发文件照常；回合结束后 IM 是最近来源，照发', async ($, on) => {
+  let pending = [{ id: 'm9', text: '怎么判' }]
+  const calls = fakeRelay(on, {
+    '/mod/poll': () => {
+      const messages = pending
+      pending = []
+      return { ok: true, messages }
+    },
+  })
+  const { submitted, clock } = engineBeneath(on)
+  await startSession($)
+  await clock.advance(2000)
+  await $.turn.start({ text: submitted[0] ?? '', turnId: 't1' })
+
+  const text = await $.tool.call({ tool: 'mcp__cc-im-bridge__send', text: '判法如下' })
+  expect(String(text.deny)).toContain('自动发回')
+  const file = await $.tool.call({ tool: 'mcp__cc-im-bridge__send', file: '/tmp/a.png' })
+  expect(file.result).toBe('已交给 IM 发送：/tmp/a.png')
+  expect(calls.filter(c => c.path === '/mod/reply').length).toBe(0)
+
+  await $.turn.complete({ answer: '判法如下', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  const later = await $.tool.call({ tool: 'mcp__cc-im-bridge__send', text: '后台任务跑完了' })
+  expect(later.result).toBe('已发送到 IM')
 })
