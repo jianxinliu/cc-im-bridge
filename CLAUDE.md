@@ -1,6 +1,6 @@
 # cc-im-bridge 项目说明
 
-企业微信 ↔ 本机 Claude Code 会话的双向桥。用法与安装见 README.md，版本见 CHANGELOG.md。
+企业微信 ↔ 本机 Claude Code 会话的双向桥。用法见 README.md，新人从零安装见 docs/上手.md（改了安装步骤、脚本参数或报错文字要同步这份文档），版本见 CHANGELOG.md。
 
 ## 结构
 

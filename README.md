@@ -15,40 +15,13 @@
 
 ## 安装
 
-前提：Node 22+，Claude Code 2.1.3xx+，一个企业微信智能机器人（API 配置选「使用长连接」）。
+第一次装，按 [docs/上手.md](docs/上手.md) 一步步做：从在企业微信里建机器人开始，到在企微发出第一条消息，最后附排错。概括起来是：
 
-1. 写企微配置（Secret 输入不回显，文件权限 600）：
-
-   ```bash
-   scripts/setup-wecom.sh
-   ```
-
-2. 让中转开机自启：
-
-   ```bash
-   CC_IM_NODE=/opt/homebrew/bin/node scripts/launchd.sh install
-   ```
-
-3. 安装会话插件（所有会话生效）：
-
-   ```bash
-   claude plugin marketplace add ~/workspace/ai/cc-im-bridge
-   ```
-
-   ```bash
-   claude plugin install cc-im-bridge@cc-im-bridge-local --scope user
-   ```
-
-4. 登记审批钩子：在 `~/.claude/settings.json` 的 `hooks` 里加
-
-   ```json
-   "PermissionRequest": [
-     { "matcher": "*", "hooks": [{ "type": "command", "timeout": 660,
-       "command": "/opt/homebrew/bin/node /Users/<你>/workspace/ai/cc-im-bridge/hooks/permission-request.mjs" }] }
-   ]
-   ```
-
-5. 在企微里给机器人发一条消息。不在白名单时机器人会回你的 userid，把它加进 `~/.cc-im-bridge/wecom.json` 的 `allowUsers`，再重启中转（`scripts/launchd.sh install` 会重启）。
+1. 企业微信「工作台」→「智能机器人」建一个 API 模式、使用长连接的机器人，拿到 Bot ID 和 Secret；
+2. `scripts/setup-wecom.sh` 写配置；`scripts/launchd.sh install` 让中转常驻；
+3. `claude plugin marketplace add <仓库目录>`，`claude plugin install cc-im-bridge@cc-im-bridge-local --scope user`，重启 Claude Desktop；
+4. 在 `~/.claude/settings.json` 登记 `PermissionRequest` 钩子（审批转发用）；
+5. 给机器人发条消息拿到 userid，加进白名单。
 
 改了 mod 代码后：升 `mod/cc-im-bridge/.claude-plugin/plugin.json` 的 version，执行 `claude plugin update cc-im-bridge@cc-im-bridge-local`，再重启 Claude Desktop（已在运行的会话执行 `/reload-plugins` 不会换到新版本）。Claude Code 加载的是安装时缓存的副本，只改仓库不升版本不会生效。如果改的是 `send` 工具的说明或参数，已开的会话里模型仍看到旧的工具定义（例如不知道能发文件），在该会话执行一次 `/compact` 或新开会话才会更新。改了中转代码后重新执行 `scripts/launchd.sh install`。
 
