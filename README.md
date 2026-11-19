@@ -50,7 +50,7 @@
 
 5. 在企微里给机器人发一条消息。不在白名单时机器人会回你的 userid，把它加进 `~/.cc-im-bridge/wecom.json` 的 `allowUsers`，再重启中转（`scripts/launchd.sh install` 会重启）。
 
-改了 mod 代码后：升 `mod/cc-im-bridge/.claude-plugin/plugin.json` 的 version，执行 `claude plugin update cc-im-bridge@cc-im-bridge-local`，再重启 Claude Desktop（已在运行的会话执行 `/reload-plugins` 不会换到新版本）。Claude Code 加载的是安装时缓存的副本，只改仓库不升版本不会生效。改了中转代码后重新执行 `scripts/launchd.sh install`。
+改了 mod 代码后：升 `mod/cc-im-bridge/.claude-plugin/plugin.json` 的 version，执行 `claude plugin update cc-im-bridge@cc-im-bridge-local`，再重启 Claude Desktop（已在运行的会话执行 `/reload-plugins` 不会换到新版本）。Claude Code 加载的是安装时缓存的副本，只改仓库不升版本不会生效。如果改的是 `send` 工具的说明或参数，已开的会话里模型仍看到旧的工具定义（例如不知道能发文件），在该会话执行一次 `/compact` 或新开会话才会更新。改了中转代码后重新执行 `scripts/launchd.sh install`。
 
 ## 在企微里怎么用
 
