@@ -18,6 +18,19 @@ const LIST_PHRASES = new Set(['/list', '/ls', '会话', '会话列表', '有哪�
 const SUGGEST_PHRASES = new Set(['建议', '接下来做什么', '下一步', '有什么建议'])
 const SUGGESTION_TTL_MS = 10 * 60_000
 const MAX_SUGGESTIONS = 4
+const QUICK_PHRASES = new Set(['常问', '常问问题', '常见问题', '快捷问题'])
+// 企微按钮卡片最多 6 个按钮。
+export const MAX_QUICK_QUESTIONS = 6
+export const DEFAULT_QUICK_QUESTIONS = [
+  '现在进展怎么样了？',
+  '有需要我决定的事吗？',
+  '总结一下刚才做了什么',
+  '接下来打算做什么？',
+  '有报错或卡住的地方吗？',
+  '继续',
+]
+// 面板（下一步建议、常问问题）保留多少组供点击；更早的点了提示过期。
+const MAX_PANELS = 20
 const HELP_PHRASES = new Set(['/help', '用法', '帮助', 'help', '?', '？'])
 const HELP_TEXT = [
   '会话：点选会话',
@@ -27,7 +40,8 @@ const HELP_TEXT = [
   '离开：选一个会话遥控（离开 2：直接指定）',
   '回来了：所有会话退出遥控',
   '好 / 不行，原因：批准或拒绝',
-  '建议：按会话上下文给几个下一步，点编号发送',
+  '常问：调出常问问题，点编号发送',
+  '建议：按会话上下文生成几个下一步，点编号发送',
   '/pending：查看待批',
 ].join('\n')
 const STOP_PHRASES = new Set(['停', '停止', '停下', '中断', '别做了', 'stop'])
@@ -54,6 +68,8 @@ export function createRelay({
   onTargetChange = () => {},
   initialNumbers = {},
   onNumbersChange = () => {},
+  // 常问问题面板的内容；每次调出时取一次，改了配置不用重启。
+  quickQuestions = () => DEFAULT_QUICK_QUESTIONS,
 } = {}) {
   const sessions = new Map() // sessionId -> { sessionId, name, cwd, lastSeen, queue: [] }
   const log = [] // 发往 IM 的消息与收到的 IM 消息，供 IM 适配器按序号拉取
@@ -72,8 +88,11 @@ export function createRelay({
   let questionSeq = 0
   let messageSeq = 0
   // 最近一次的「下一步建议」：{ id, sessionId, items, createdAt }。回复编号或点卡片按钮即发送对应那条。
-  let latestSuggestions = null
-  let suggestionSeq = 0
+  // 发出过的面板：id -> { id, kind: 'suggest' | 'quick', sessionId, items, createdAt }。
+  const panels = new Map()
+  // 最近发出、还能用回编号来选的那一组；选过一条就清空，免得之后回的数字又被当成选面板。
+  let latestPanel = null
+  let panelSeq = 0
   let approvalSeq = 0
 
   const isOnline = s => now() - s.lastSeen <= ONLINE_WINDOW_MS
@@ -292,13 +311,23 @@ export function createRelay({
     const use = text.match(USE_PATTERN)
     if (use) {
       const r = useSession(use[1])
-      return tell(r.ok ? `之后的消息发给 ${r.name}` : r.error)
+      if (!r.ok) return tell(r.error)
+      tell(`之后的消息发给 ${r.name}`)
+      showQuickPanel(r.num)
+      return
     }
 
     const decision = text.match(/^\/(y|n)(?:\s+([\s\S]*))?$/)
     if (decision) return decideFromIm(decision[1] === 'y', decision[2] ?? '')
 
     if (answerFromText(text)) return
+
+    if (QUICK_PHRASES.has(text)) {
+      const s = currentSession()
+      if (!s) return tell('先选一个会话：发「会话」点选')
+      showQuickPanel(s.num)
+      return
+    }
 
     if (SUGGEST_PHRASES.has(text)) {
       const s = currentSession()
@@ -308,14 +337,14 @@ export function createRelay({
       return tell(`正在让 ${label(s)} 想几个下一步…`)
     }
 
-    // 刚给过建议时，单独回一个编号就发送那条；只认当前会话的建议，切到别的会话后数字照常发给它。
+    // 刚发过面板时，单独回一个编号就发送那条；只认当前会话的面板，切到别的会话后数字照常发给它。
     if (
       /^\d$/.test(text) &&
-      latestSuggestions &&
-      latestSuggestions.sessionId === currentSession()?.sessionId &&
-      now() - latestSuggestions.createdAt <= SUGGESTION_TTL_MS
+      latestPanel &&
+      latestPanel.sessionId === currentSession()?.sessionId &&
+      now() - latestPanel.createdAt <= SUGGESTION_TTL_MS
     ) {
-      const r = sendSuggestion({ id: latestSuggestions.id, n: Number(text) })
+      const r = sendSuggestion({ id: latestPanel.id, n: Number(text) })
       if (!r.ok) tell(r.error)
       return
     }
@@ -333,14 +362,21 @@ export function createRelay({
     const awayTarget = text.match(AWAY_WITH_TARGET)
     if (awayTarget) {
       const r = awaySession(awayTarget[1])
-      return tell(r.ok ? r.message : r.error)
+      if (!r.ok) return tell(r.error)
+      tell(r.message)
+      showQuickPanel(r.num)
+      return
     }
 
     // 「离开」：只有一个在线会话就直接遥控它；多个时回一张卡片让你选。
     if (AWAY_PHRASES.has(text)) {
       const online = [...sessions.values()].filter(isOnline)
       if (online.length === 0) return tell('没有在线的会话')
-      if (online.length === 1) return tell(awaySession(online[0].num).message)
+      if (online.length === 1) {
+        tell(awaySession(online[0].num).message)
+        showQuickPanel(online[0].num)
+        return
+      }
       const rows = list()
       pushLog({
         dir: 'out',
@@ -404,7 +440,7 @@ export function createRelay({
     if (on) {
       // 会话自己已经开了，不必再给它下发开启指令。
       s.away = true
-      const r = awaySession(s.num, { suggest: false })
+      const r = awaySession(s.num)
       tell(r.message)
       return { ok: true }
     }
@@ -434,36 +470,56 @@ export function createRelay({
       tell(`${label(s)}：没想出合适的下一步`)
       return { ok: true }
     }
-    latestSuggestions = { id: ++suggestionSeq, sessionId, items: clean, createdAt: now() }
-    pushLog({
-      dir: 'out',
-      from: label(s),
-      text: ['接下来可以：', ...clean.map((t, i) => `${i + 1}. ${t}`), '回复编号发送'].join('\n'),
-      suggestions: { id: latestSuggestions.id, name: label(s), items: clean },
-    })
+    showPanel(s, 'suggest', clean)
     return { ok: true }
   }
 
-  // 发送第 n 条建议（从 1 起），像用户自己说的一样投给会话。
+  function showPanel(s, kind, items) {
+    const panel = { id: ++panelSeq, kind, sessionId: s.sessionId, items, createdAt: now() }
+    panels.set(panel.id, panel)
+    if (panels.size > MAX_PANELS) panels.delete(panels.keys().next().value)
+    latestPanel = panel
+    const heading = kind === 'quick' ? '常问：' : '接下来可以：'
+    pushLog({
+      dir: 'out',
+      from: label(s),
+      text: [heading, ...items.map((t, i) => `${i + 1}. ${t}`), '回复编号发送'].join('\n'),
+      suggestions: { id: panel.id, kind, name: label(s), items },
+    })
+  }
+
+  // 常问问题面板：内容固定（可配置），不调模型。切换或遥控一个会话后发一次，发「常问」随时再调出。
+  function showQuickPanel(ref) {
+    const { session: s } = resolve(String(ref))
+    if (!s) return
+    const configured = (Array.isArray(quickQuestions()) ? quickQuestions() : [])
+      .map(t => String(t).replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .slice(0, MAX_QUICK_QUESTIONS)
+    showPanel(s, 'quick', configured.length ? configured : DEFAULT_QUICK_QUESTIONS)
+  }
+
+  // 发送面板里第 n 条（从 1 起），像用户自己说的一样投给会话。
+  // 建议按当时的上下文生成，10 分钟后作废、用一次即作废；常问问题一直能点。
   function sendSuggestion({ id, n }) {
-    const sug = latestSuggestions
-    if (!sug || sug.id !== Number(id) || now() - sug.createdAt > SUGGESTION_TTL_MS) {
-      return { ok: false, error: '这组建议已过期，发「建议」重新生成' }
+    const panel = panels.get(Number(id))
+    const isQuick = panel?.kind === 'quick'
+    if (!panel || (!isQuick && now() - panel.createdAt > SUGGESTION_TTL_MS)) {
+      return { ok: false, error: isQuick || !panel ? '这张卡片已过期，发「常问」或「建议」重新调出' : '这组建议已过期，发「建议」重新生成' }
     }
-    const text = sug.items[n - 1]
-    const s = sessions.get(sug.sessionId)
-    if (!text) return { ok: false, error: `没有第 ${n} 条建议` }
+    const text = panel.items[n - 1]
+    const s = sessions.get(panel.sessionId)
+    if (!text) return { ok: false, error: `没有第 ${n} 条` }
     if (!s) return { ok: false, error: '会话已不存在' }
-    // 发出一条后这组建议就用掉了，免得之后回的数字又被当成选建议。
-    latestSuggestions = null
+    if (!isQuick) panels.delete(panel.id)
+    if (latestPanel === panel) latestPanel = null
     deliver(s, text)
-    return { ok: true, text }
+    return { ok: true, text, kind: panel.kind }
   }
 
   // 遥控一个会话：它进入离开模式并成为当前会话；同一时间只遥控一个，其他会话退出离开模式，
   // 否则多个会话的回复会一起涌进 IM。
-  // suggest：是否顺带生成下一步建议。在电脑上开的不需要（人还在电脑前），省一次模型调用。
-  function awaySession(ref, { suggest = true } = {}) {
+  function awaySession(ref) {
     const { session: s, error } = resolve(String(ref))
     if (!s) return { ok: false, error }
     const released = []
@@ -476,11 +532,11 @@ export function createRelay({
     if (!s.away) s.controls.push({ type: 'away', on: true })
     s.away = true
     setTarget(s.sessionId)
-    if (suggest) requestSuggestions(s)
     const switched = released.length ? `（${released.join('、')} 已退出遥控）` : ''
     return {
       ok: true,
       name: label(s),
+      num: s.num,
       rows: list(),
       message: `正在遥控 ${label(s)}：它每一轮的回复、审批、提问都发到这里${switched}。回到电脑说「回来了」`,
     }
@@ -491,7 +547,6 @@ export function createRelay({
     const { session: s, error } = resolve(String(ref))
     if (!s) return { ok: false, error }
     setTarget(s.sessionId)
-    requestSuggestions(s)
     return { ok: true, name: label(s), num: s.num }
   }
 
@@ -799,6 +854,7 @@ export function createRelay({
     awayFromSession,
     suggestions,
     sendSuggestion,
+    showQuickPanel,
     fileOut,
     tell,
     setForward,

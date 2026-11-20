@@ -57,17 +57,19 @@ const SESSION_KEY = /^(use|away):(\d+)$/
 const QUESTION_KEY = /^q:(\d+):(\d+):(\d+)$/
 const SUGGESTION_KEY = /^sug:(\d+):(\d+)$/
 
-// 下一步建议卡片：建议写在正文里，按钮只放编号（按钮太窄放不下句子）。
-export function suggestionsCard({ id, name, items }, taskPrefix, sent) {
+// 面板卡片（下一步建议、常问问题）：内容写在正文里，按钮只放编号（按钮太窄放不下句子）。
+// 建议用一次就作废，点过后只剩「已发送」；常问问题可以反复点，按钮一直保留。
+export function suggestionsCard({ id, name, items, kind }, taskPrefix, sent) {
+  const isQuick = kind === 'quick'
   const card = {
     card_type: 'button_interaction',
     source: { desc: 'cc-im-bridge' },
-    main_title: { title: `${name} 接下来可以`, desc: sent ? `已发送：${sent}` : '点编号直接发给它' },
+    main_title: { title: isQuick ? `${name} 常问` : `${name} 接下来可以`, desc: sent ? `已发送：${sent}` : '点编号直接发给它' },
     sub_title_text: items.map((t, i) => `${i + 1}. ${t}`).join('\n'),
     card_action: { type: 0 },
     task_id: `${taskPrefix}_g${id}`,
   }
-  card.button_list = sent
+  card.button_list = sent && !isQuick
     ? [{ text: '已发送', style: 2, key: `sug:${id}:done` }]
     : items.map((_, i) => ({ text: String(i + 1), style: 2, key: `sug:${id}:${i + 1}` }))
   return card
@@ -360,7 +362,7 @@ export function createWecomAdapter({
   function handleSuggestionPick(frame, id, n, taskId) {
     const sent = suggestionCards.get(id)
     if (!sent || taskId !== `${taskPrefix}_g${id}`) {
-      send('这组建议已过期，发「建议」重新生成').catch(err => log.warn(`企微：${err.message}`))
+      send('这张卡片已过期（中转重启过），发「常问」或「建议」重新调出').catch(err => log.warn(`企微：${err.message}`))
       return
     }
     const r = onSuggestionPick({ id, n })

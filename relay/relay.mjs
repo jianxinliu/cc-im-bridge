@@ -9,7 +9,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { createRelay } from './core.mjs'
+import { DEFAULT_QUICK_QUESTIONS, createRelay } from './core.mjs'
 import { outboundKind, safeFilename, sniffExtension } from './media.mjs'
 import { createTitleReader } from './titles.mjs'
 import { createWecomAdapter, formatOutgoing, loadWecomConfig } from './wecom.mjs'
@@ -30,6 +30,21 @@ try {
 } catch (err) {
   if (err.code !== 'ENOENT') console.warn(`读取 ${RELAY_STATE} 失败，忽略：${err.message}`)
 }
+// 常问问题：~/.cc-im-bridge/quick-questions.json 里写字符串数组即可覆盖默认清单。每次调出时读一次，改了不用重启。
+// 文件不存在用默认；格式不对时记日志、用默认，不让一张卡片因此发不出去。
+const QUICK_QUESTIONS_FILE = join(HOME, 'quick-questions.json')
+function readQuickQuestions() {
+  if (!existsSync(QUICK_QUESTIONS_FILE)) return DEFAULT_QUICK_QUESTIONS
+  try {
+    const list = JSON.parse(readFileSync(QUICK_QUESTIONS_FILE, 'utf8'))
+    if (Array.isArray(list) && list.every(t => typeof t === 'string')) return list
+    console.warn(`${QUICK_QUESTIONS_FILE} 应为字符串数组（如 ["进展如何？", "继续"]），改用默认清单`)
+  } catch (err) {
+    console.warn(`读 ${QUICK_QUESTIONS_FILE} 失败，改用默认清单：${err.message}`)
+  }
+  return DEFAULT_QUICK_QUESTIONS
+}
+
 function saveState(patch) {
   Object.assign(state, patch)
   try {
@@ -39,6 +54,7 @@ function saveState(patch) {
   }
 }
 const relay = createRelay({
+  quickQuestions: readQuickQuestions,
   initialTarget: state.target ?? null,
   onTargetChange: target => saveState({ target }),
   initialNumbers: state.numbers ?? {},
@@ -287,11 +303,17 @@ try {
         const lines = files.map(f => `[${f.kind === 'image' ? '图片' : '文件'}] ${saveInbound(f)}`)
         relay.handleIncoming([meta.text, ...lines].filter(Boolean).join('\n'), { reqId: meta.reqId })
       },
-      onUseSession: num => (relay.useSession(num).ok ? relay.list() : null),
+      onUseSession: num => {
+        if (!relay.useSession(num).ok) return null
+        relay.showQuickPanel(num)
+        return relay.list()
+      },
       onAwaySession: num => {
         const r = relay.awaySession(num)
-        if (r.ok) relay.tell(r.message)
-        return r.ok ? r.rows : null
+        if (!r.ok) return null
+        relay.tell(r.message)
+        relay.showQuickPanel(num)
+        return r.rows
       },
       onQuestionPick: pick => relay.pickQuestionOption(pick),
       onSuggestionPick: pick => relay.sendSuggestion(pick),

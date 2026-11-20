@@ -694,6 +694,15 @@ test('建议卡片：正文列建议、按钮放编号；点了发送并更新�
   assert.equal(socket().lastSent().body.template_card.main_title.desc, '已发送：2. 提交')
 })
 
+test('常问卡片：标题写「常问」；点过后仍保留编号按钮，只在说明里标已发送', () => {
+  const panel = { id: 5, kind: 'quick', name: 'api', items: ['进展？', '继续'] }
+  const card = suggestionsCard(panel, 'p')
+  assert.deepEqual([card.main_title.title, card.main_title.desc], ['api 常问', '点编号直接发给它'])
+  const after = suggestionsCard(panel, 'p', '2. 继续')
+  assert.equal(after.main_title.desc, '已发送：2. 继续')
+  assert.deepEqual(after.button_list.map(b => b.key), ['sug:5:1', 'sug:5:2'])
+})
+
 const fakeFetch = (responses) => async url => {
   const r = responses[url]
   if (!r) return { ok: false, status: 404, headers: new Headers(), arrayBuffer: async () => new ArrayBuffer(0) }

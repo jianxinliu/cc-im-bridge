@@ -1,16 +1,17 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { ONLINE_WINDOW_MS, createRelay } from '../relay/core.mjs'
+import { DEFAULT_QUICK_QUESTIONS, ONLINE_WINDOW_MS, createRelay } from '../relay/core.mjs'
 
 // 切换会话会顺带下发「生成建议」，只关心其他指令的断言用它过滤掉。
 const nonSuggest = r => r.controls.filter(c => c.type !== 'suggest')
 
-function setup() {
+function setup(options = {}) {
   let t = 1_000_000
   const clock = { now: () => t, advance: ms => (t += ms) }
-  const relay = createRelay({ now: clock.now })
-  const lastReply = () => relay.since(0).at(-1)?.text
+  const relay = createRelay({ now: clock.now, ...options })
+  // 切换、遥控会话后会跟一张常问问题卡片；只看文字回执的断言跳过卡片。
+  const lastReply = () => relay.since(0).filter(e => !e.suggestions).at(-1)?.text
   return { relay, clock, lastReply }
 }
 
@@ -398,7 +399,7 @@ test('有侧边栏标题时：列表、投递回执、回复、审批都显示�
   const titles = { s1: 'cc-im-bridge 开发', s2: '判例整理与模型适用说明' }
   let t = 1_000_000
   const relay = createRelay({ now: () => t, titleOf: id => titles[id] })
-  const lastReply = () => relay.since(0).at(-1)
+  const lastReply = () => relay.since(0).filter(e => !e.suggestions).at(-1)
   relay.register({ sessionId: 's1', name: 'cc-im-bridge', cwd: '' })
   relay.register({ sessionId: 's2', name: 'tpa', cwd: '' })
   relay.register({ sessionId: 's3', name: 'plain', cwd: '' })
@@ -618,16 +619,19 @@ test('「用法」「/help」回简短用法，不发给会话', () => {
   assert.equal(relay.poll({ sessionId: 's1' }).messages.length, 0)
 })
 
-test('建议：切换会话后让它生成建议；结果以卡片发出，回编号就发送那条，发完即作废', () => {
-  const { relay, lastReply } = setup()
+test('建议：只在发「建议」时生成，切换会话不再生成；结果以卡片发出，回编号就发送那条，发完即作废', () => {
+  const { relay } = setup()
   relay.register({ sessionId: 's1', name: 'api', cwd: '' })
   relay.register({ sessionId: 's2', name: 'web', cwd: '' })
   relay.handleIncoming('切到 web')
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).controls, [], '切换会话不调模型')
+  relay.handleIncoming('建议')
   assert.deepEqual(relay.poll({ sessionId: 's2' }).controls, [{ type: 'suggest' }])
 
   relay.suggestions({ sessionId: 's2', items: ['  跑一下测试 ', '', '提交代码', '写文档', '推送', '第五条不要'] })
   const card = relay.since(0).at(-1)
   assert.deepEqual(card.suggestions.items, ['跑一下测试', '提交代码', '写文档', '推送'])
+  assert.equal(card.suggestions.kind, 'suggest')
   assert.match(card.text, /^接下来可以：\n1\. 跑一下测试/)
 
   relay.handleIncoming('2')
@@ -635,6 +639,52 @@ test('建议：切换会话后让它生成建议；结果以卡片发出，回�
   relay.handleIncoming('2')
   assert.deepEqual(relay.poll({ sessionId: 's2' }).messages.map(m => m.text), ['2'], '用掉后数字当普通消息')
   assert.equal(relay.sendSuggestion({ id: card.suggestions.id, n: 1 }).ok, false)
+})
+
+test('常问：切换、遥控会话后发一张常问问题卡片（不调模型）；点编号发给它，可反复点；回编号只认第一次', () => {
+  const { relay, lastReply } = setup()
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.register({ sessionId: 's2', name: 'web', cwd: '' })
+  relay.handleIncoming('切到 web')
+  const card = relay.since(0).at(-1)
+  assert.equal(lastReply(), '之后的消息发给 web')
+  assert.equal(relay.since(0).at(-2).text, '之后的消息发给 web', '先回执，后卡片')
+  assert.deepEqual(card.suggestions, { id: card.suggestions.id, kind: 'quick', name: 'web', items: DEFAULT_QUICK_QUESTIONS })
+  assert.match(card.text, /^常问：\n1\. 现在进展怎么样了？/)
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).controls, [])
+
+  relay.handleIncoming('1')
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).messages.map(m => m.text), ['现在进展怎么样了？'])
+  relay.handleIncoming('1')
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).messages.map(m => m.text), ['1'], '选过一次后，回数字当普通消息')
+  assert.equal(relay.sendSuggestion({ id: card.suggestions.id, n: 6 }).text, '继续', '卡片按钮仍能点')
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).messages.map(m => m.text), ['继续'])
+  assert.match(relay.sendSuggestion({ id: card.suggestions.id, n: 9 }).error, /没有第 9 条/)
+
+  relay.handleIncoming('离开 api')
+  assert.match(lastReply(), /^正在遥控 api/)
+  assert.equal(relay.since(0).at(-1).suggestions.name, 'api')
+})
+
+test('常问：发「常问」对当前会话调出；没选会话时提示；清单可配置，空的或格式不对时用默认，最多 6 条', () => {
+  let configured = ['  进展？ ', '', '跑测试', 3]
+  const { relay, lastReply } = setup({ quickQuestions: () => configured })
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.register({ sessionId: 's2', name: 'web', cwd: '' })
+  relay.handleIncoming('常问')
+  assert.equal(lastReply(), '先选一个会话：发「会话」点选')
+  relay.handleIncoming('切到 api')
+  relay.handleIncoming('常问')
+  assert.deepEqual(relay.since(0).at(-1).suggestions.items, ['进展？', '跑测试', '3'])
+  configured = Array.from({ length: 8 }, (_, i) => `问题${i + 1}`)
+  relay.handleIncoming('常问')
+  assert.equal(relay.since(0).at(-1).suggestions.items.length, 6)
+  configured = ['  ']
+  relay.handleIncoming('常问')
+  assert.deepEqual(relay.since(0).at(-1).suggestions.items, DEFAULT_QUICK_QUESTIONS)
+  configured = 'not a list'
+  relay.handleIncoming('常问')
+  assert.deepEqual(relay.since(0).at(-1).suggestions.items, DEFAULT_QUICK_QUESTIONS)
 })
 
 test('建议：发「建议」对当前会话生成；会话出错时转告；超过 10 分钟作废；重复请求不重复下发', () => {
@@ -689,7 +739,7 @@ test('流式：投给离线会话时，流开头标明已排队', () => {
   assert.equal(relay.since(0).at(-1).stream.queued, true)
 })
 
-test('建议：切到别的会话后，回数字照常发给新会话，不再当作选建议', () => {
+test('建议：切到别的会话后，回数字不再当作选旧会话的建议', () => {
   const { relay } = setup()
   relay.register({ sessionId: 's1', name: 'api', cwd: '' })
   relay.register({ sessionId: 's2', name: 'web', cwd: '' })
@@ -697,9 +747,6 @@ test('建议：切到别的会话后，回数字照常发给新会话，不再�
   relay.suggestions({ sessionId: 's1', items: ['跑测试', '提交'] })
   relay.handleIncoming('切到 web')
   relay.handleIncoming('2')
-  assert.deepEqual(relay.poll({ sessionId: 's2' }).messages.map(m => m.text), ['2'])
-  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages, [])
-  relay.handleIncoming('切到 api')
-  relay.handleIncoming('2')
-  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages.map(m => m.text), ['提交'], '切回来仍可用')
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).messages, [], '不发给 api')
+  assert.deepEqual(relay.poll({ sessionId: 's2' }).messages.map(m => m.text), ['有需要我决定的事吗？'], '数字选的是 web 的常问问题')
 })
