@@ -1,7 +1,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
-const VERSION = '0.7.4'
+const VERSION = '0.7.5'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
 const MAX_NAME_CHARS = 32
@@ -47,8 +47,6 @@ const bridge = {
   runningTurnId: '',
   // 正在生成下一步建议：一次只生成一组。
   isSuggesting: false,
-  // 用户最近一条消息从哪来：computer 为在电脑输入框里发的，im 为从 IM 发的；还没有时为空。
-  lastPromptFrom: '' as '' | 'computer' | 'im',
 }
 
 // 审批真正发生在 settings 的 PermissionRequest 钩子里；mod 只告诉中转现在该不该转。
@@ -188,7 +186,7 @@ async function start($: EngineInterface, cwd: string) {
   await $.tool.register({
     name: 'send',
     description:
-      '给用户的 IM（企业微信）发一条消息或一个本机文件。用于用户不在电脑前时，任务完成、出错、需要用户决定时主动通知，或把截图、报告等文件发到用户手机（PNG/JPG 不超过 10MB 按图片发，其他不超过 20MB 按文件发）。IM 发来的消息你正常回复即可，会自动发回，不要再用本工具发回复；用户最近一条消息是在电脑上发的（不带「[企微]」开头），说明人在电脑前，只发文字会被拒绝。用户从 IM 发来的图片和文件已存在本机，消息里会给出「[图片] 路径」「[文件] 路径」，直接读取即可。',
+      '给用户的 IM（企业微信）发一条消息或一个本机文件。用于任务完成、出错、需要用户决定时主动通知，或把截图、报告等文件发到用户手机（PNG/JPG 不超过 10MB 按图片发，其他不超过 20MB 按文件发）。只在值得打扰用户时发，日常对话的回复写在回复里即可。IM 发来的消息你正常回复即可，会自动发回，不要再用本工具发回复（只发文字会被拒绝）。用户从 IM 发来的图片和文件已存在本机，消息里会给出「[图片] 路径」「[文件] 路径」，直接读取即可。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -229,12 +227,10 @@ async function reportProgress($: EngineInterface, tool: string, summary: string)
   }
 }
 
-// send 只发文字时，哪些情况不发：模型容易延续「用户在 IM 上」的印象，在用户回到电脑后仍往 IM 发。
-// 发文件不受限：用户在电脑前也可能要把截图、报告发到手机。
-export function sendTextRefusal(state: { isImTurn: boolean; isAway: boolean; lastPromptFrom: string }) {
+// IM 发起的回合里不让 send 只发文字：回复本来就会发回 IM，再用 send 发一遍会重复，
+// 模型还常把正式回复写成一句「已发到企微」。发文件不受限。其余时候 send 照常发，用于主动通知。
+export function sendTextRefusal(state: { isImTurn: boolean }) {
   if (state.isImTurn) return '本轮是 IM 发来的，回复会自动发回 IM。把要说的内容直接写在回复里，不要再调用 send。'
-  if (!state.isAway && state.lastPromptFrom === 'computer')
-    return '用户最近一条消息是在电脑上发的，人在电脑前，消息没有发到 IM。把内容直接写在回复里；用户要离开后收到通知，请提醒用户执行 /im-away on 或在 IM 里说「离开」。'
   return undefined
 }
 
@@ -422,10 +418,7 @@ export const register: Register = on => {
   ).catch(() => ({ deny: `${PLUGIN}：发送失败，钩子出错` }))
 
   on('prompt.submit', async ($, e, next) => {
-    if (isTypedAtComputer(e.origin.kind, Boolean(e.command))) {
-      bridge.lastPromptFrom = 'computer'
-      if (bridge.isAway) await setAway($, 'off', 'local', 'typed')
-    }
+    if (bridge.isAway && isTypedAtComputer(e.origin.kind, Boolean(e.command))) await setAway($, 'off', 'local', 'typed')
     return next(e)
   })
 
@@ -436,10 +429,7 @@ export const register: Register = on => {
       // 没有消息 id 时（中转没给）仍算 IM 回合，只是无法接到流式回复上。
       const msgId = imMatch ? (imMatch[1] ?? '') : undefined
       bridge.isImTurn = msgId !== undefined
-      if (msgId !== undefined) {
-        bridge.imTurns.set(e.turnId, msgId)
-        bridge.lastPromptFrom = 'im'
-      }
+      if (msgId !== undefined) bridge.imTurns.set(e.turnId, msgId)
       bridge.currentMsgId = msgId ?? ''
       await pushForward($)
     }

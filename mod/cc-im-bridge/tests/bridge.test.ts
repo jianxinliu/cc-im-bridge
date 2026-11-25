@@ -64,7 +64,7 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.7.4' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.7.5' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
@@ -445,16 +445,23 @@ test('/im-push off 时，IM 发起的回合仍给那条消息收尾（不发回�
   expect(calls.filter(c => c.path === '/mod/reply').length).toBe(1)
 })
 
-test('send 只发文字：IM 发起的回合里拒绝；人在电脑前且没开离开模式时拒绝；其余照发', () => {
-  expect(sendTextRefusal({ isImTurn: true, isAway: false, lastPromptFrom: 'im' })).toContain('自动发回')
-  expect(sendTextRefusal({ isImTurn: true, isAway: true, lastPromptFrom: 'im' })).toContain('自动发回')
-  expect(sendTextRefusal({ isImTurn: false, isAway: false, lastPromptFrom: 'computer' })).toContain('人在电脑前')
-  expect(sendTextRefusal({ isImTurn: false, isAway: true, lastPromptFrom: 'computer' })).toBeUndefined()
-  expect(sendTextRefusal({ isImTurn: false, isAway: false, lastPromptFrom: 'im' })).toBeUndefined()
-  expect(sendTextRefusal({ isImTurn: false, isAway: false, lastPromptFrom: '' })).toBeUndefined()
+test('send 只发文字：只在 IM 发起的回合里拒绝', () => {
+  expect(sendTextRefusal({ isImTurn: true })).toContain('自动发回')
+  expect(sendTextRefusal({ isImTurn: false })).toBeUndefined()
 })
 
-test('IM 发起的回合里 send 只发文字被拒（回复会自动发回）；发文件照常；回合结束后 IM 是最近来源，照发', async ($, on) => {
+test('在电脑上发消息后，send 仍能主动发文字通知', async ($, on) => {
+  const calls = fakeRelay(on, { '/mod/poll': () => ({ ok: true, messages: [] }) })
+  engineBeneath(on)
+  await startSession($)
+  await $.prompt.submit({ text: '跑完全量回测后通知我', origin: { kind: 'composer', asUser: true } as never })
+  await $.turn.start({ text: '跑完全量回测后通知我', turnId: 't1' })
+  const sent = await $.tool.call({ tool: 'mcp__cc-im-bridge__send', text: '回测跑完了' })
+  expect(sent.result).toBe('已发送到 IM')
+  expect(calls.filter(c => c.path === '/mod/reply').at(-1)?.body.text).toBe('回测跑完了')
+})
+
+test('IM 发起的回合里 send 只发文字被拒（回复会自动发回）；发文件照常；回合结束后照发', async ($, on) => {
   let pending = [{ id: 'm9', text: '怎么判' }]
   const calls = fakeRelay(on, {
     '/mod/poll': () => {
