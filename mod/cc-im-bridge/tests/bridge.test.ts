@@ -64,14 +64,17 @@ test('登记会话后取到的 IM 消息作为新回合提交，回复发回 IM'
 
   expect(calls[0]).toEqual({
     path: '/mod/register',
-    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.7.5' },
+    body: { sessionId: 'abcd1234-session', name: 'api', cwd: '/Users/me/work/api', version: '0.7.6' },
   })
   expect(submitted.length).toBe(1)
   expect(submitted[0]).toContain('跑一下测试')
 
   await $.turn.start({ text: submitted[0] ?? '', turnId: 't1' })
   await $.turn.complete({ answer: '测试全部通过', durationMs: 10, isAborted: false, turnId: 't1', reason: 'answer' })
-  expect(calls.at(-1)).toEqual({ path: '/mod/reply', body: { sessionId: 'abcd1234-session', text: '测试全部通过' } })
+  expect(calls.at(-1)).toEqual({
+    path: '/mod/reply',
+    body: { sessionId: 'abcd1234-session', text: '测试全部通过', kind: 'answer', reason: 'im' },
+  })
 })
 
 test('不是 IM 发起的回合，默认不回传', async ($, on) => {
@@ -128,7 +131,7 @@ test('send 工具把文字发到 IM；空文字被拒绝', async ($, on) => {
 
   const sent = await $.tool.call({ tool: 'mcp__cc-im-bridge__send', text: '部署完成' })
   expect(sent.result).toBe('已发送到 IM')
-  expect(calls.at(-1)).toEqual({ path: '/mod/reply', body: { sessionId: 'abcd1234-session', text: '部署完成' } })
+  expect(calls.at(-1)).toEqual({ path: '/mod/reply', body: { sessionId: 'abcd1234-session', text: '部署完成', kind: 'send', origin: '' } })
 
   const empty = await $.tool.call({ tool: 'mcp__cc-im-bridge__send', text: '  ' })
   expect(empty.deny).toBe('text 和 file 至少给一个')
@@ -303,7 +306,13 @@ test('流式进度：IM 消息带 id 提交；该回合每个工具报一行进�
     { sessionId: 'abcd1234-session', msgId: 'm7', tool: 'Bash', summary: 'npm test' },
   ])
   await $.turn.complete({ answer: '全部通过', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
-  expect(calls.filter(c => c.path === '/mod/reply').at(-1)?.body).toEqual({ sessionId: 'abcd1234-session', text: '全部通过', msgId: 'm7' })
+  expect(calls.filter(c => c.path === '/mod/reply').at(-1)?.body).toEqual({
+    sessionId: 'abcd1234-session',
+    text: '全部通过',
+    msgId: 'm7',
+    kind: 'answer',
+    reason: 'im',
+  })
 
   await $.turn.start({ text: '本地提问', turnId: 't2' })
   await $.tool.call({ tool: 'Bash', command: 'ls' })
@@ -394,10 +403,13 @@ test('在电脑上 /im-away 开关时通知中转；IM 里说「离开」触发�
   expect(calls.filter(c => c.path === '/mod/away').map(c => c.body.on)).toEqual([true, false])
 })
 
-test('只有在电脑输入框里发的普通消息才算回到电脑前', () => {
-  expect(isTypedAtComputer('composer', false)).toBe(true)
-  expect(isTypedAtComputer('composer', true)).toBe(false)
-  for (const kind of ['plugin', 'task-notification', 'bridge', 'sdk']) expect(isTypedAtComputer(kind, false)).toBe(false)
+test('在电脑输入框里发的消息和斜杠命令（/im-… 除外）才算回到电脑前', () => {
+  expect(isTypedAtComputer('composer')).toBe(true)
+  expect(isTypedAtComputer('composer', 'compact')).toBe(true)
+  expect(isTypedAtComputer('composer', 'im-away')).toBe(false)
+  for (const kind of ['plugin', 'task-notification', 'scheduled-trigger', 'peer', 'bridge', 'sdk', '']) {
+    expect(isTypedAtComputer(kind)).toBe(false)
+  }
 })
 
 test('离开模式下，IM 转来的消息（插件提交）不会关闭离开模式', async ($, on) => {
@@ -484,4 +496,45 @@ test('IM 发起的回合里 send 只发文字被拒（回复会自动发回）�
   await $.turn.complete({ answer: '判法如下', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
   const later = await $.tool.call({ tool: 'mcp__cc-im-bridge__send', text: '后台任务跑完了' })
   expect(later.result).toBe('已发送到 IM')
+})
+
+const typedAt = (input: string) => ({ text: input, origin: { kind: 'composer', asUser: true } }) as never
+
+test('在电脑上发消息或斜杠命令：告诉中转人回来了；本会话在离开模式时自己关掉，不另发通知', async ($, on) => {
+  const calls = fakeRelay(on, { '/mod/poll': () => ({ ok: true, messages: [] }) })
+  on('command.run', () => ({ text: '' }))
+  const { clock } = engineBeneath(on)
+  await startSession($)
+  await clock.advance(2000)
+  await $.command.run({ command: 'im-away', args: 'on' })
+
+  await $.prompt.submit(typedAt('我回来了'))
+  expect(calls.filter(c => c.path === '/mod/typed').map(c => c.body)).toEqual([{ sessionId: 'abcd1234-session' }])
+  expect((await $.command.run({ command: 'im-status', args: '' })).text).toContain('离开模式：off')
+  expect(calls.filter(c => c.path === '/mod/away').map(c => c.body.on)).toEqual([true])
+
+  await $.command.run({ command: 'compact', args: '', origin: { kind: 'composer' } } as never)
+  await $.command.run({ command: 'im-status', args: '', origin: { kind: 'composer' } } as never)
+  expect(calls.filter(c => c.path === '/mod/typed').length).toBe(2)
+  await $.prompt.submit({ text: '后台任务完成', origin: { kind: 'task-notification', asUser: true } } as never)
+  expect(calls.filter(c => c.path === '/mod/typed').length).toBe(2)
+})
+
+test('send 带上本轮来源；中转说人在电脑前时，拒绝理由告诉模型', async ($, on) => {
+  const calls = fakeRelay(on, {
+    '/mod/poll': () => ({ ok: true, messages: [] }),
+    '/mod/reply': body => (body.origin === 'composer' ? { ok: false, status: 409, error: '用户在电脑前' } : { ok: true }),
+  })
+  engineBeneath(on)
+  await startSession($)
+
+  await $.prompt.submit({ text: '检查一下监控', origin: { kind: 'scheduled-trigger', asUser: true } } as never)
+  await $.turn.start({ text: '检查一下监控', turnId: 't1' })
+  expect((await $.tool.call({ tool: 'mcp__cc-im-bridge__send', text: '监控报警了' })).result).toBe('已发送到 IM')
+  expect(calls.filter(c => c.path === '/mod/reply').at(-1)?.body.origin).toBe('scheduled-trigger')
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+
+  await $.prompt.submit(typedAt('跑完通知我'))
+  await $.turn.start({ text: '跑完通知我', turnId: 't2' })
+  expect(String((await $.tool.call({ tool: 'mcp__cc-im-bridge__send', text: '跑完了' })).deny)).toBe('用户在电脑前')
 })

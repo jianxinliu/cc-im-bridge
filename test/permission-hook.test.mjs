@@ -1,7 +1,7 @@
 // 起真实中转，用真实钩子脚本（子进程、stdin 输入）走一遍审批转发。
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -66,6 +66,8 @@ const event = (sessionId, extra = {}) => ({
 })
 
 before(async () => {
+  // 从「人在手机上」开始（上次运行留下的状态）；也顺带验证中转重启后沿用这个状态。
+  writeFileSync(join(home, 'relay-state.json'), JSON.stringify({ present: false }))
   relay = spawn(process.execPath, [RELAY], { env: { ...process.env, CC_IM_HOME: home, CC_IM_WEB_PORT: String(port) } })
   await new Promise((resolve, reject) => {
     let out = ''
@@ -213,4 +215,21 @@ test('中转没在跑、输入坏了：不输出，退出码 0', async () => {
   const bad = await runHook('{oops')
   assert.deepEqual([bad.code, bad.stdout], [0, ''])
   assert.match(bad.stderr, /读不懂钩子输入/)
+})
+
+test('人回到电脑前（任一会话报告在电脑上发了消息）：审批不再转到 IM；从 IM 发消息后恢复', async () => {
+  await request({ socket: true, path: '/mod/typed', body: { sessionId: 'off' } })
+  assert.match(await lastText(), /^你在电脑上给 web 发了消息，之后不再往这里发/)
+  const started = Date.now()
+  const r = await runHook(event('on'))
+  assert.deepEqual([r.code, r.stdout], [0, ''])
+  assert.ok(Date.now() - started < 2000, '不转就立即交回本地')
+  assert.equal(JSON.parse(readFileSync(join(home, 'relay-state.json'), 'utf8')).present, true, '状态已保存')
+
+  await request({ path: '/api/send', body: { text: '我又出门了' } })
+  const before = (await pendingIds()).length
+  const running = runHook(event('on'))
+  const id = await waitForApproval(before + 1)
+  await request({ path: '/api/send', body: { text: `/y ${id}` } })
+  assert.equal(JSON.parse((await running).stdout).hookSpecificOutput.decision.behavior, 'allow')
 })

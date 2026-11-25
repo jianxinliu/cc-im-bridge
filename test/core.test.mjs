@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { DEFAULT_QUICK_QUESTIONS, ONLINE_WINDOW_MS, createRelay } from '../relay/core.mjs'
+import { AT_COMPUTER_NOTE, AT_COMPUTER_SEND_ERROR, DEFAULT_QUICK_QUESTIONS, ONLINE_WINDOW_MS, createRelay } from '../relay/core.mjs'
 
 // 切换会话会顺带下发「生成建议」，只关心其他指令的断言用它过滤掉。
 const nonSuggest = r => r.controls.filter(c => c.type !== 'suggest')
@@ -9,7 +9,8 @@ const nonSuggest = r => r.controls.filter(c => c.type !== 'suggest')
 function setup(options = {}) {
   let t = 1_000_000
   const clock = { now: () => t, advance: ms => (t += ms) }
-  const relay = createRelay({ now: clock.now, ...options })
+  // 多数用例模拟人在手机上用企微；测「回到电脑前」的用例自己传 initialPresent。
+  const relay = createRelay({ now: clock.now, initialPresent: false, ...options })
   // 切换、遥控会话后会跟一张常问问题卡片；只看文字回执的断言跳过卡片。
   const lastReply = () => relay.since(0).filter(e => !e.suggestions).at(-1)?.text
   return { relay, clock, lastReply }
@@ -498,7 +499,7 @@ test('遥控同一时间只有一个会话：「离开 2」切过去，原来的
   relay.handleIncoming('离开 api')
   assert.deepEqual(nonSuggest(relay.poll({ sessionId: 's1' })), [{ type: 'away', on: true }])
   relay.handleIncoming('离开 2')
-  assert.equal(lastReply(), '正在遥控 web：它每一轮的回复、审批、提问都发到这里（api 已退出遥控）。回到电脑说「回来了」')
+  assert.equal(lastReply(), '正在遥控 web：它每一轮的回复、审批、提问都发到这里（api 已退出遥控）。回到电脑后给任一会话发条消息，或说「回来了」')
   assert.deepEqual(nonSuggest(relay.poll({ sessionId: 's1' })), [{ type: 'away', on: false }])
   assert.deepEqual(nonSuggest(relay.poll({ sessionId: 's2' })), [{ type: 'away', on: true }])
   relay.handleIncoming('离开 2')
@@ -749,4 +750,84 @@ test('建议：切到别的会话后，回数字不再当作选旧会话的建�
   relay.handleIncoming('2')
   assert.deepEqual(relay.poll({ sessionId: 's1' }).messages, [], '不发给 api')
   assert.deepEqual(relay.poll({ sessionId: 's2' }).messages.map(m => m.text), ['有需要我决定的事吗？'], '数字选的是 web 的常问问题')
+})
+
+test('回到电脑前：任一会话报告在电脑上发了消息，所有会话退出遥控，通知一次；已在电脑前时不再通知', () => {
+  const changes = []
+  const { relay, lastReply } = setup({ onPresentChange: v => changes.push(v) })
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.register({ sessionId: 's2', name: 'web', cwd: '' })
+  relay.handleIncoming('离开 api')
+  relay.poll({ sessionId: 's1' })
+
+  assert.deepEqual(relay.typedAtComputer({ sessionId: 's2' }), { ok: true, changed: true })
+  assert.equal(relay.isPresent(), true)
+  assert.match(lastReply(), /^你在电脑上给 web 发了消息，之后不再往这里发（定时、事件触发的通知除外）；api 已退出遥控/)
+  assert.deepEqual(relay.poll({ sessionId: 's1' }).controls, [{ type: 'away', on: false }], '遥控中的会话收到退出指令')
+  assert.equal(relay.list().some(r => r.away), false)
+
+  const count = relay.since(0).length
+  assert.deepEqual(relay.typedAtComputer({ sessionId: 's1' }), { ok: true, changed: false })
+  assert.equal(relay.since(0).length, count, '不重复通知')
+  assert.deepEqual(changes, [true], '状态变化交给调用方保存')
+})
+
+test('在电脑前时：企微回合的回复不发、只给那条消息收尾；离开模式的回复和进度不发；/im-push all 和旧版插件照发', () => {
+  const { relay } = setup({ initialPresent: true })
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  const out = () => relay.since(0).filter(e => e.dir === 'out')
+
+  assert.deepEqual(relay.reply({ sessionId: 's1', text: '长回复', msgId: 'm1', kind: 'answer', reason: 'im' }), { ok: true, held: true })
+  const { text, stream } = out().at(-1)
+  assert.deepEqual({ text, stream }, { text: AT_COMPUTER_NOTE, stream: { key: 'm1', phase: 'final' } })
+  const count = out().length
+  assert.equal(relay.reply({ sessionId: 's1', text: '遥控回复', kind: 'answer', reason: 'away' }).held, true)
+  assert.equal(relay.progress({ sessionId: 's1', msgId: 'm1', tool: 'Bash', summary: 'ls' }).held, true)
+  assert.equal(out().length, count, '都没发')
+
+  relay.reply({ sessionId: 's1', text: '全部回传', kind: 'answer', reason: 'all' })
+  assert.equal(out().at(-1).text, '全部回传')
+  relay.reply({ sessionId: 's1', text: '旧版插件' })
+  assert.equal(out().at(-1).text, '旧版插件')
+})
+
+test('在电脑前时：send 只在人打字发起的回合里被拒；定时、事件触发的回合照发', () => {
+  const { relay } = setup({ initialPresent: true })
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  assert.deepEqual(relay.reply({ sessionId: 's1', text: '做完了', kind: 'send', origin: 'composer' }), {
+    ok: false,
+    status: 409,
+    error: AT_COMPUTER_SEND_ERROR,
+  })
+  for (const origin of ['scheduled-trigger', 'task-notification', 'peer', '']) {
+    assert.equal(relay.reply({ sessionId: 's1', text: `来自 ${origin}`, kind: 'send', origin }).ok, true)
+    assert.equal(relay.since(0).at(-1).text, `来自 ${origin}`)
+  }
+})
+
+test('在电脑前时：审批和提问不转到 IM；从 IM 发来消息后恢复转发', () => {
+  const { relay } = setup({ initialPresent: true })
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.poll({ sessionId: 's1', forward: true })
+  assert.deepEqual(relay.hookPermission({ sessionId: 's1', tool: 'Bash', summary: 'ls' }), { ok: true, forward: false })
+  assert.deepEqual(relay.askQuestions({ sessionId: 's1', questions: [{ question: '选哪个', options: [] }] }), { ok: true, forward: false })
+
+  relay.handleIncoming('跑一下测试')
+  assert.equal(relay.isPresent(), false, '从 IM 发了消息，人在手机上')
+  assert.equal(relay.hookPermission({ sessionId: 's1', tool: 'Bash', summary: 'ls' }).forward, true)
+  relay.reply({ sessionId: 's1', text: '测试通过', msgId: 'm1', kind: 'answer', reason: 'im' })
+  assert.equal(relay.since(0).at(-1).text, '测试通过')
+})
+
+test('在电脑上开离开模式算去了手机上；在电脑上关、企微里说「回来了」算回到电脑前', () => {
+  const { relay } = setup({ initialPresent: true })
+  relay.register({ sessionId: 's1', name: 'api', cwd: '' })
+  relay.awayFromSession({ sessionId: 's1', on: true })
+  assert.equal(relay.isPresent(), false)
+  relay.awayFromSession({ sessionId: 's1', on: false })
+  assert.equal(relay.isPresent(), true)
+  relay.handleIncoming('离开')
+  assert.equal(relay.isPresent(), false)
+  relay.handleIncoming('回来了')
+  assert.equal(relay.isPresent(), true)
 })

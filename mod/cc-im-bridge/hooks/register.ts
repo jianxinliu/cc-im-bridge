@@ -1,7 +1,7 @@
 import type { EngineInterface, Register } from 'claude-code'
 
 const PLUGIN = 'cc-im-bridge'
-const VERSION = '0.7.5'
+const VERSION = '0.7.6'
 const POLL_MS = 2000
 const MAX_REPLY_CHARS = 4000
 const MAX_NAME_CHARS = 32
@@ -47,7 +47,14 @@ const bridge = {
   runningTurnId: '',
   // 正在生成下一步建议：一次只生成一组。
   isSuggesting: false,
+  // 最近一次提交的来源（prompt.submit 的 origin.kind）；下一个回合开始时记为该回合的来源。
+  lastSubmitOrigin: '',
+  // 主循环当前回合的来源：composer 为人在电脑上打字发起的，scheduled-trigger、task-notification 等为定时或事件触发的。
+  turnOrigin: '',
 }
+
+// 发往中转的回复说明自己是什么，中转据此决定人在电脑前时发不发（见 relay/core.mjs 的 reply）。
+type ReplyMeta = { kind: 'send'; origin: string } | { kind: 'answer'; reason: 'im' | 'away' | 'all' }
 
 // 审批真正发生在 settings 的 PermissionRequest 钩子里；mod 只告诉中转现在该不该转。
 const shouldForward = () => bridge.isAway || bridge.isImTurn
@@ -112,9 +119,10 @@ async function tick($: EngineInterface) {
   }
 }
 
-async function sendToIm($: EngineInterface, text: string, msgId?: string) {
+async function sendToIm($: EngineInterface, text: string, msgId?: string, meta?: ReplyMeta) {
   const body = text.length > MAX_REPLY_CHARS ? `${text.slice(0, MAX_REPLY_CHARS)}\n…（已截断）` : text
-  const r = await call($, '/mod/reply', { sessionId: bridge.sessionId, text: body, ...(msgId ? { msgId } : {}) })
+  const r = await call($, '/mod/reply', { sessionId: bridge.sessionId, text: body, ...(msgId ? { msgId } : {}), ...meta })
+  if (r.status === 409) throw new Error(r.error ?? '人在电脑前，没有发到 IM')
   if (!r.ok) throw new Error(`发往 IM 失败：${r.error ?? r.status}`)
 }
 
@@ -186,7 +194,7 @@ async function start($: EngineInterface, cwd: string) {
   await $.tool.register({
     name: 'send',
     description:
-      '给用户的 IM（企业微信）发一条消息或一个本机文件。用于任务完成、出错、需要用户决定时主动通知，或把截图、报告等文件发到用户手机（PNG/JPG 不超过 10MB 按图片发，其他不超过 20MB 按文件发）。只在值得打扰用户时发，日常对话的回复写在回复里即可。IM 发来的消息你正常回复即可，会自动发回，不要再用本工具发回复（只发文字会被拒绝）。用户从 IM 发来的图片和文件已存在本机，消息里会给出「[图片] 路径」「[文件] 路径」，直接读取即可。',
+      '给用户的 IM（企业微信）发一条消息或一个本机文件。用于任务完成、出错、需要用户决定时主动通知（用户在电脑前时，只在定时任务、后台任务跑完等非用户打字发起的回合里能发文字），或把截图、报告等文件发到用户手机（PNG/JPG 不超过 10MB 按图片发，其他不超过 20MB 按文件发）。只在值得打扰用户时发，日常对话的回复写在回复里即可。IM 发来的消息你正常回复即可，会自动发回，不要再用本工具发回复（只发文字会被拒绝）。用户从 IM 发来的图片和文件已存在本机，消息里会给出「[图片] 路径」「[文件] 路径」，直接读取即可。',
     inputSchema: {
       type: 'object',
       properties: {
@@ -206,12 +214,16 @@ async function forwardAnswer($: EngineInterface, turnId: string, answer: string,
   // 离开模式下每一轮都发；否则按 /im-push。
   if (!bridge.isAway && (bridge.pushMode === 'off' || (bridge.pushMode === 'im' && !fromIm))) {
     // IM 发起的回合在企微那条消息上开了「思考中」，不发回复也要给它收尾，否则一直停在思考中。
-    if (fromIm && msgId) await sendToIm($, '（本轮已完成；按 /im-push off 设置，回复没有发回）', msgId).catch(err => report($, describe(err)))
+    if (fromIm && msgId) {
+      await sendToIm($, '（本轮已完成；按 /im-push off 设置，回复没有发回）', msgId, { kind: 'answer', reason: 'im' }).catch(err =>
+        report($, describe(err)),
+      )
+    }
     return
   }
   const text = isAborted ? '（本轮被中断）' : answer.trim() || '（本轮没有文字回复）'
   try {
-    await sendToIm($, text, msgId || undefined)
+    await sendToIm($, text, msgId || undefined, { kind: 'answer', reason: fromIm ? 'im' : bridge.isAway ? 'away' : 'all' })
   } catch (err) {
     report($, describe(err))
   }
@@ -244,7 +256,7 @@ async function sendFromTool($: EngineInterface, text: string, file: string) {
       if (!r.ok) return { deny: `文件没发出：${r.error ?? r.status}` }
       return { result: `已交给 IM 发送：${file}` }
     }
-    await sendToIm($, text)
+    await sendToIm($, text, undefined, { kind: 'send', origin: bridge.turnOrigin })
     return { result: '已发送到 IM' }
   } catch (err) {
     return { deny: describe(err) }
@@ -287,9 +299,8 @@ async function settleLocal($: EngineInterface, body: { tool?: string; summary?: 
   }
 }
 
-// source：local 为在电脑上执行 /im-away，要通知 IM；im 为 IM 里说的，中转已经回复过。
-// reason：通知里说明为什么关的（typed：人在电脑上发了消息）。
-async function setAway($: EngineInterface, wanted: string, source: 'local' | 'im' = 'local', reason?: 'typed') {
+// source：local 为在电脑上执行 /im-away，要通知 IM；im 为中转已经知道（IM 里说的，或人回到电脑前由中转统一处理）。
+async function setAway($: EngineInterface, wanted: string, source: 'local' | 'im' = 'local') {
   if (wanted !== 'on' && wanted !== 'off') {
     return `当前：${bridge.isAway ? 'on' : 'off'}。on：离开电脑，本会话的回复、审批、提问都发到 IM；off：只有 IM 发起的回合才发`
   }
@@ -299,7 +310,7 @@ async function setAway($: EngineInterface, wanted: string, source: 'local' | 'im
   await pushForward($)
   if (source === 'local' && changed && bridge.isRegistered) {
     try {
-      await call($, '/mod/away', { sessionId: bridge.sessionId, on: bridge.isAway, ...(reason ? { reason } : {}) })
+      await call($, '/mod/away', { sessionId: bridge.sessionId, on: bridge.isAway })
     } catch (err) {
       report($, `通知 IM 失败：${describe(err)}`)
     }
@@ -338,10 +349,22 @@ export function parseSuggestions(text: string) {
     .slice(0, MAX_SUGGESTIONS)
 }
 
-// 人在 Desktop 输入框里发了普通消息，说明回到电脑前了，离开模式该自动关。
-// 斜杠命令（含 /im-away on 本身）、IM 转来的（plugin）、后台通知等都不算。
-export function isTypedAtComputer(originKind: string, isCommand: boolean) {
-  return originKind === 'composer' && !isCommand
+// 人在电脑输入框里发了消息或斜杠命令，说明回到电脑前了。/im-… 不算：/im-away on 本身就是要离开。
+// IM 转来的（plugin）、后台通知、定时任务、别的会话来信等都不算。command 为斜杠命令名（不带 /），普通消息为空。
+export function isTypedAtComputer(originKind: string, command = '') {
+  return originKind === 'composer' && !command.startsWith('im-')
+}
+
+// 告诉中转人回到电脑前了：中转让所有会话退出遥控、之后拦下发往 IM 的消息。
+// 本会话若在离开模式，自己先关掉；中转会统一通知 IM，这里不再单独通知。
+async function markTypedAtComputer($: EngineInterface) {
+  if (bridge.isAway) await setAway($, 'off', 'im')
+  if (!bridge.isRegistered) return
+  try {
+    await call($, '/mod/typed', { sessionId: bridge.sessionId })
+  } catch (err) {
+    report($, describe(err))
+  }
 }
 
 async function suggestNext($: EngineInterface) {
@@ -418,13 +441,23 @@ export const register: Register = on => {
   ).catch(() => ({ deny: `${PLUGIN}：发送失败，钩子出错` }))
 
   on('prompt.submit', async ($, e, next) => {
-    if (bridge.isAway && isTypedAtComputer(e.origin.kind, Boolean(e.command))) await setAway($, 'off', 'local', 'typed')
+    bridge.lastSubmitOrigin = e.origin.kind
+    // 斜杠命令在 command.run 里认，这里只认普通消息。
+    if (!e.command && isTypedAtComputer(e.origin.kind)) await markTypedAtComputer($)
+    return next(e)
+  })
+
+  on('command.run', async ($, e, next) => {
+    // 插件自己调用的命令（$.command.run）在测试替身里不带 origin，按非电脑输入处理。
+    if (isTypedAtComputer(e.origin?.kind ?? '', e.command)) await markTypedAtComputer($)
     return next(e)
   })
 
   on('turn.start', async ($, e, next) => {
     if (!e.agentId) {
       bridge.runningTurnId = e.turnId
+      bridge.turnOrigin = bridge.lastSubmitOrigin
+      bridge.lastSubmitOrigin = ''
       const imMatch = IM_MESSAGE_ID.exec(e.text)
       // 没有消息 id 时（中转没给）仍算 IM 回合，只是无法接到流式回复上。
       const msgId = imMatch ? (imMatch[1] ?? '') : undefined

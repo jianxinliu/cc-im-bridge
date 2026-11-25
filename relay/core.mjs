@@ -21,6 +21,9 @@ const MAX_SUGGESTIONS = 4
 const QUICK_PHRASES = new Set(['常问', '常问问题', '常见问题', '快捷问题'])
 // 企微按钮卡片最多 6 个按钮。
 export const MAX_QUICK_QUESTIONS = 6
+// 人在电脑前时，替企微回合收尾的那句话（回复不发到企微）。
+export const AT_COMPUTER_NOTE = '（你已回到电脑，这一轮的回复在电脑上看）'
+export const AT_COMPUTER_SEND_ERROR = '用户在电脑前（最近在电脑上给某个会话发了消息），本轮是用户在电脑上发起的，消息没有发到 IM。把内容直接写在回复里。'
 export const DEFAULT_QUICK_QUESTIONS = [
   '现在进展怎么样了？',
   '有需要我决定的事吗？',
@@ -38,7 +41,7 @@ const HELP_TEXT = [
   '名字：内容：只发这一条',
   '停：中断当前这一轮',
   '离开：选一个会话遥控（离开 2：直接指定）',
-  '回来了：所有会话退出遥控',
+  '回来了：所有会话退出遥控（在电脑上给任一会话发消息也一样）',
   '好 / 不行，原因：批准或拒绝',
   '常问：调出常问问题，点编号发送',
   '建议：按会话上下文生成几个下一步，点编号发送',
@@ -70,6 +73,9 @@ export function createRelay({
   onNumbersChange = () => {},
   // 常问问题面板的内容；每次调出时取一次，改了配置不用重启。
   quickQuestions = () => DEFAULT_QUICK_QUESTIONS,
+  // 人在不在电脑前（见 setPresent）；中转重启后沿用上次的值。
+  initialPresent = true,
+  onPresentChange = () => {},
 } = {}) {
   const sessions = new Map() // sessionId -> { sessionId, name, cwd, lastSeen, queue: [] }
   const log = [] // 发往 IM 的消息与收到的 IM 消息，供 IM 适配器按序号拉取
@@ -79,6 +85,15 @@ export function createRelay({
     if (sessionId === target) return
     target = sessionId
     onTargetChange(target)
+  }
+  // 人在电脑前：在任一会话的电脑输入框里发了消息，或在电脑上关了离开模式。
+  // 在电脑前时，会话发往 IM 的回复、进度、审批、提问都不发；只放行定时、事件触发的回合用 send 发的通知、
+  // 发文件和 /im-push all。从 IM 发来任何消息、或开离开模式，就回到「在手机上」。
+  let present = initialPresent
+  function setPresent(value) {
+    if (value === present) return
+    present = value
+    onPresentChange(present)
   }
   const outgoingListeners = [] // IM 适配器：每条发往 IM 的消息都通知它们
   const approvals = new Map() // id -> { id, sessionId, name, tool, summary, status, reason, createdAt }
@@ -222,11 +237,19 @@ export function createRelay({
   }
 
   // msgId：这条回复对应的企微消息（会话插件从提示词里认出）。带上时 IM 适配器把它作为那条消息的流式回复收尾。
-  function reply({ sessionId, text, msgId }) {
+  // kind：send 为模型用 send 工具主动发的，origin 是本轮的来源；answer 为回合结束时的回复，
+  // reason 是为什么发（im：企微发起的回合；away：离开模式；all：/im-push all）。旧版插件不带 kind，照发。
+  function reply({ sessionId, text, msgId, kind, origin, reason }) {
     const s = sessions.get(sessionId)
     if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
     if (!text?.trim()) return { ok: false, status: 400, error: 'text 为空' }
     s.lastSeen = now()
+    if (present && kind === 'send' && origin === 'composer') return { ok: false, status: 409, error: AT_COMPUTER_SEND_ERROR }
+    if (present && kind === 'answer' && reason !== 'all') {
+      // 企微那条消息开着「思考中」，要收个尾；其余的不发。
+      if (msgId) pushLog({ dir: 'out', from: label(s), text: AT_COMPUTER_NOTE, stream: { key: msgId, phase: 'final' } })
+      return { ok: true, held: true }
+    }
     pushLog({ dir: 'out', from: label(s), text, ...(msgId ? { stream: { key: msgId, phase: 'final' } } : {}) })
     return { ok: true }
   }
@@ -246,6 +269,7 @@ export function createRelay({
     const s = sessions.get(sessionId)
     if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
     if (!msgId || !tool) return { ok: false, status: 400, error: 'msgId 和 tool 必填' }
+    if (present) return { ok: true, held: true }
     const brief = String(summary ?? '').replace(/\s+/g, ' ').trim()
     const line = `${describeTool(tool)}${brief ? `：${brief.length > PROGRESS_CHARS ? `${brief.slice(0, PROGRESS_CHARS)}…` : brief}` : ''}`
     pushLog({ dir: 'out', from: label(s), text: line, stream: { key: msgId, phase: 'progress' } })
@@ -294,6 +318,7 @@ export function createRelay({
     const text = String(raw ?? '').trim()
     if (!text) return
     pushLog({ dir: 'in', from: 'me', text })
+    setPresent(false)
 
     if (LIST_PHRASES.has(text)) {
       const rows = list()
@@ -394,6 +419,7 @@ export function createRelay({
         s.controls.push({ type: 'away', on: false })
         s.away = false
       }
+      setPresent(true)
       return tell(remote.length ? `已关闭离开模式：${remote.map(label).join('、')}` : '没有开着离开模式的会话')
     }
 
@@ -438,6 +464,7 @@ export function createRelay({
     const s = sessions.get(sessionId)
     if (!s) return { ok: false, status: 404, error: `未登记的会话 ${sessionId}` }
     if (on) {
+      setPresent(false)
       // 会话自己已经开了，不必再给它下发开启指令。
       s.away = true
       const r = awaySession(s.num)
@@ -445,8 +472,28 @@ export function createRelay({
       return { ok: true }
     }
     s.away = false
+    setPresent(true)
     tell(`${label(s)} 已退出遥控（${reason === 'typed' ? '你在电脑上发了消息' : '在电脑上关闭'}）`)
     return { ok: true }
+  }
+
+  // 在电脑上给任一会话发了消息（含斜杠命令，/im-… 除外）：人回到电脑前。
+  // 所有会话退出遥控，之后发往 IM 的都拦下（见 present）。已在电脑前时不重复通知。
+  function typedAtComputer({ sessionId }) {
+    if (present) return { ok: true, changed: false }
+    setPresent(true)
+    const released = []
+    for (const other of sessions.values()) {
+      if (!other.away) continue
+      other.controls.push({ type: 'away', on: false })
+      other.away = false
+      released.push(label(other))
+    }
+    const s = sessions.get(sessionId)
+    const where = s ? `给 ${label(s)} ` : ''
+    const extra = released.length ? `；${released.join('、')} 已退出遥控` : ''
+    tell(`你在电脑上${where}发了消息，之后不再往这里发（定时、事件触发的通知除外）${extra}。要再用手机，直接发消息或说「离开」`)
+    return { ok: true, changed: true }
   }
 
   // 让会话插件按上下文生成几条下一步建议（插件调模型，结果经 suggestions() 回来）。
@@ -538,7 +585,7 @@ export function createRelay({
       name: label(s),
       num: s.num,
       rows: list(),
-      message: `正在遥控 ${label(s)}：它每一轮的回复、审批、提问都发到这里${switched}。回到电脑说「回来了」`,
+      message: `正在遥控 ${label(s)}：它每一轮的回复、审批、提问都发到这里${switched}。回到电脑后给任一会话发条消息，或说「回来了」`,
     }
   }
 
@@ -615,7 +662,7 @@ export function createRelay({
   // 未登记、离线或没开转发的会话直接答「不转」，让本地照常弹框。
   function hookPermission({ sessionId, tool, summary, detail }) {
     const s = sessions.get(sessionId)
-    if (!s || !isOnline(s) || !s.forward) return { ok: true, forward: false }
+    if (!s || !isOnline(s) || !s.forward || present) return { ok: true, forward: false }
     return { ...requestApproval({ sessionId, tool, summary, detail }), forward: true }
   }
 
@@ -728,7 +775,7 @@ export function createRelay({
   // 一次提问最多 4 个问题；每个问题一张卡片，编号与卡片按钮一致。
   function askQuestions({ sessionId, questions: items }) {
     const s = sessions.get(sessionId)
-    if (!s || !isOnline(s) || !s.forward) return { ok: true, forward: false }
+    if (!s || !isOnline(s) || !s.forward || present) return { ok: true, forward: false }
     if (!Array.isArray(items) || items.length === 0) return { ok: false, status: 400, error: 'questions 不能为空' }
     const q = {
       id: ++questionSeq,
@@ -852,6 +899,8 @@ export function createRelay({
     useSession,
     awaySession,
     awayFromSession,
+    typedAtComputer,
+    isPresent: () => present,
     suggestions,
     sendSuggestion,
     showQuickPanel,

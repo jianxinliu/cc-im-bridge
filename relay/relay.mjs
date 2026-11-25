@@ -24,7 +24,7 @@ const PAGE = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'web.htm
 const readTitle = createTitleReader()
 // 记住当前会话和各会话的编号：中转重启后会话会带着同一个 id 重新登记，不用重选、编号不变。
 const RELAY_STATE = join(HOME, 'relay-state.json')
-const state = { target: null, numbers: {} }
+const state = { target: null, numbers: {}, present: true }
 try {
   Object.assign(state, JSON.parse(readFileSync(RELAY_STATE, 'utf8')))
 } catch (err) {
@@ -55,6 +55,8 @@ function saveState(patch) {
 }
 const relay = createRelay({
   quickQuestions: readQuickQuestions,
+  initialPresent: state.present ?? true,
+  onPresentChange: present => saveState({ present }),
   initialTarget: state.target ?? null,
   onTargetChange: target => saveState({ target }),
   initialNumbers: state.numbers ?? {},
@@ -146,6 +148,7 @@ const modRoutes = {
   'POST /mod/suggestions': relay.suggestions,
   'POST /mod/file': sendFileFromSession,
   'POST /mod/away': relay.awayFromSession,
+  'POST /mod/typed': relay.typedAtComputer,
   'POST /mod/approval/request': relay.requestApproval,
   'POST /mod/approval/cancel': relay.cancelApproval,
   'POST /mod/forward': relay.setForward,

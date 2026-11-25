@@ -32,6 +32,7 @@
 
 - **改了 `$.tool.register` 的描述或参数，已有会话的模型看不到**：会话里模型看到的工具定义在会话内是固定的，升级插件、重启 Desktop 后钩子代码换成新版，但模型手里仍是旧定义，直到该会话压缩上下文（compact）或新开会话。2026-11-18 实测：「AI 项目经理」会话中转上报 0.7.3，18:02 看到的 `send` 仍只有 `text`，于是回答用户「企微只能发文字，发不了图」；00:34 自动压缩后才拿到带 `file` 的定义。核对办法：在会话记录里找最新一条含 `"name": "mcp__cc-im-bridge__send"` 的 `api-request-shape`，看参数里有没有新字段。因此，新能力要让已开的会话马上用上时，别只改已有工具的参数；靠提示传达的规则写进工具的返回或拒绝信息里，不要只写在描述里。
 - **用 heredoc 或 python 脚本往文件里写大段中文后，要查有没有替换字符（U+FFFD）**：`grep -n $'\xef\xbf\xbd' <文件>`。2026-11-19 提交信息里的「仓库」、2026-11-20 常问问题默认清单里的「么」都在写入时变成了乱码，前者已进了一次提交（推送前 amend 改掉）。
+- **认「人在电脑上打字」看 `origin.kind === 'composer'`**（引擎类型 `PromptOrigin`，2026-11-25 查 `claude-code.d.ts`）：其余取值有 `scheduled-trigger`（定时任务、/loop）、`task-notification`（后台任务完成）、`peer`/`peer-send-message`（别的会话来信）、`bridge`（Remote Control）、`sdk`、插件自己提交的等。斜杠命令在 `command.run` 里认（它也带 `origin`）；`prompt.submit` 只对会交给模型的命令带 `e.command`，`/im-status` 这类本地命令不经过它。`turn.start` 不带来源，回合来源取开始前最后一次 `prompt.submit` 的 origin。测试替身里插件调用 `$.command.run` 不带 `origin`，读时要容错。
 - 企微长连接握手区分请求头大小写：只认 `Sec-WebSocket-Key`，小写返回 404。Node 自带 WebSocket（undici）改不了头名。
 - 企微卡片点击事件：`event_key`、`task_id` 在 `body.event.template_card_event` 下，官方 SDK 1.0.7 类型写在 `body.event` 下。更新卡片要在 5 秒内用**该事件的 req_id** 发 `aibot_respond_update_msg`。
 - 审批编号每次启动从 1 计，卡片 `task_id` 带启动随机前缀，点击时校验，旧卡片不生效。
