@@ -9,6 +9,7 @@
 - `relay/wecom.mjs`：企微智能机器人长连接适配器；`relay/ws-client.mjs`：自写 WebSocket 客户端。
 - `relay/titles.mjs`：从 `~/.claude/projects/*/<会话 id>.jsonl` 读最新的 `custom-title` 作为企微里的会话名（Desktop 侧边栏标题；每轮都会重写一次）。只读这一行，按修改时间缓存。
 - `relay/describe.mjs`：审批卡片上给人看的工具名与参数（只用于显示；匹配审批仍用 summary）。
+- `relay/lucid-blocks.mjs`：发往企微前，把回复里 Lucid 插件的组件代码块（callout / details / steps / compare / chart / diagram）转成纯文字，在 `wecom.mjs` 的 `formatOutgoing` 里调用。代码块格式以 claude-plugins 仓库 `plugins/lucid/skills/blocks/SKILL.md` 为准，那边改了格式这里要跟着改；认不出或 JSON 写错的块原样保留。
 - `relay/media.mjs`：附件。收：解析 image/file/mixed 里的 url+aeskey，解密（AES-256-CBC，IV=密钥前 16 字节，**PKCS#7 按 32 字节对齐，要关掉 Node 的自动去填充**）。发：按扩展名和大小决定图片/文件。上传在 `wecom.mjs` 的 `uploadMedia`（init → chunk(512KB) → finish 拿 media_id）。
 - `relay/summary.mjs`：审批摘要。**mod 的 `hooks/register.ts` 里有一份相同实现**，两边必须一致（mod 按摘要作废「已在电脑上处理」的审批），改一边要同步另一边。
 - `hooks/permission-request.mjs`：settings 的 PermissionRequest 钩子。

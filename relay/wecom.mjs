@@ -4,6 +4,7 @@
 import { createHash } from 'node:crypto'
 
 import { decryptMedia, extractMedia, filenameFromDisposition, MAX_DOWNLOAD_BYTES } from './media.mjs'
+import { convertLucidBlocks } from './lucid-blocks.mjs'
 
 export const WECOM_WS_URL = 'wss://openws.work.weixin.qq.com'
 const HEARTBEAT_MS = 30_000
@@ -778,7 +779,8 @@ export function loadWecomConfig(path, { readFile, stat }) {
   return { botId: config.botId, secret: config.secret, allowUsers: config.allowUsers.map(String) }
 }
 
-// 发往企微的文字：中转自己的提示原样发，会话的回复前面标上会话名。
+// 发往企微的文字：中转自己的提示原样发，会话的回复前面标上会话名，
+// 并把 Lucid 组件代码块转成纯文字（企微画不了组件，原样发过去是一段 JSON）。
 export function formatOutgoing({ from, text }) {
-  return from === 'relay' ? text : `**[${from}]**\n${text}`
+  return from === 'relay' ? text : `**[${from}]**\n${convertLucidBlocks(text)}`
 }
